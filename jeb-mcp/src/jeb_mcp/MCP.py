@@ -334,7 +334,7 @@ def getOrLoadApk(filepath):
             unit = artifact.getMainUnit()
             if isinstance(unit, IApkUnit):
                 print('[MCP] Existing artifact found. Waiting for sub-units to be processed...')
-                time.sleep(5) # Heuristic wait
+                time.sleep(3) # Heuristic wait
                 return unit
 
     # Artifact not found, let's process it
@@ -355,7 +355,7 @@ def getOrLoadApk(filepath):
         raise Exception('Timed out waiting for main unit to be available')
     
     print('[MCP] Main unit is available, waiting for analysis to complete...')
-    time.sleep(15) # Heuristic wait for analysis to populate children units
+    time.sleep(3) # Heuristic wait for analysis to populate children units
 
     if isinstance(unit, IApkUnit):
         return unit
@@ -567,8 +567,8 @@ def get_native_libraries(filepath):
     print('[MCP] Found %d native libraries after full check.' % len(native_libs))
     return native_libs
 
-def get_native_unit(apk, lib_name):
-    """Find a native code unit by name in an APK unit."""
+def _find_elf_unit(apk, lib_name):
+    """Find the ELF container unit by name."""
     if not apk or not lib_name:
         return None
 
@@ -590,12 +590,11 @@ def get_native_unit(apk, lib_name):
             except:
                 pass
 
-        # Check if it's the native library we're looking for
-        is_native = 'elf' in str(unit.getFormatType()).lower() or isinstance(unit, INativeCodeUnit)
-        if is_native and unit_name == lib_name:
+        is_elf = 'elf' in str(unit.getFormatType()).lower()
+        if is_elf and unit_name == lib_name:
+            print('[MCP] Found ELF container for %s.' % lib_name)
             return unit
 
-        # If it's a composite unit, add its children to the queue
         if hasattr(unit, 'getChildren') and callable(unit.getChildren):
             try:
                 children = unit.getChildren()
@@ -603,10 +602,25 @@ def get_native_unit(apk, lib_name):
                     for child in children:
                         if child not in units_to_check:
                             units_to_check.append(child)
-            except:
-                pass # Ignore errors getting children for this purpose
+            except Exception as e:
+                print('[MCP-DEBUG] Could not get children for unit %s: %s' % (unit_name, e))
 
-    print('[MCP] Native unit not found after full check: %s' % lib_name)
+    print('[MCP] ELF unit not found after full check: %s' % lib_name)
+    return None
+
+def get_native_unit(apk, lib_name):
+    """Find a native code IMAGE unit by name in an APK unit."""
+    elf_unit = _find_elf_unit(apk, lib_name)
+    if elf_unit:
+        if hasattr(elf_unit, 'getImageUnit'):
+            image_unit = elf_unit.getImageUnit()
+            if image_unit:
+                print('[MCP] Returning image unit from ELF container for %s.' % lib_name)
+                return image_unit
+        print('[MCP] ELF unit for %s has no image unit, returning ELF unit itself.' % lib_name)
+        return elf_unit
+    
+    print('[MCP] Native code unit not found for %s.' % lib_name)
     return None
 
 @jsonrpc
@@ -620,33 +634,30 @@ def load_native_library(filepath, lib_name):
         return None
     
     try:
-        unit = get_native_unit(apk, lib_name)
-        if unit:
-            unit_name = ''
-            try:
-                unit_name = unit.getName()
-            except:
-                pass # name is not essential here
+        elf_unit = _find_elf_unit(apk, lib_name)
+        if elf_unit:
+            # The code unit is the 'image' inside the ELF container
+            code_unit = elf_unit.getImageUnit() if hasattr(elf_unit, 'getImageUnit') else elf_unit
 
-            arch = 'unknown'
-            if hasattr(unit, 'getProcessor'):
-                arch = str(unit.getProcessor())
-            
-            entry_point = 'N/A'
-            if hasattr(unit, 'getEntryPoint') and unit.getEntryPoint():
-                entry_point = str(unit.getEntryPoint())
-            
-            base_address = 'N/A'
-            if hasattr(unit, 'getImageBase'):
-                base_address = str(unit.getImageBase())
-
-            return {
-                'name': unit_name if unit_name else lib_name,
-                'type': str(unit.getFormatType()),
-                'architecture': arch,
-                'entry_point': entry_point,
-                'base_address': base_address
+            info = {
+                'name': elf_unit.getName() if hasattr(elf_unit, 'getName') else lib_name,
+                'type': str(elf_unit.getFormatType()),
+                'architecture': 'unknown',
+                'entry_point': 'N/A',
+                'base_address': 'N/A'
             }
+
+            if code_unit and hasattr(code_unit, 'getProcessor'):
+                info['architecture'] = str(code_unit.getProcessor())
+            
+            if code_unit and hasattr(code_unit, 'getEntryPoint') and code_unit.getEntryPoint():
+                info['entry_point'] = str(code_unit.getEntryPoint())
+            
+            if code_unit and hasattr(code_unit, 'getImageBase'):
+                info['base_address'] = str(code_unit.getImageBase())
+
+            return info
+
     except Exception as e:
         print('Error loading native library: %s' % str(e))
         traceback.print_exc()
@@ -664,19 +675,54 @@ def get_native_functions(filepath, lib_name):
         return None
     
     try:
-        unit = get_native_unit(apk, lib_name)
-        if unit:
-            functions = []
-            for method in unit.getMethods():
+        # Symbols are on the ELF container unit, not the image unit.
+        unit = _find_elf_unit(apk, lib_name) 
+        if not unit:
+            return []
+
+        functions = []
+        
+        # We know from the dump that the ELF unit has getSymbols()
+        if hasattr(unit, 'getSymbols'):
+            routines = unit.getSymbols()
+        else:
+            print('[MCP-ERROR] The ELF unit does not have a getSymbols() method.')
+            return []
+        
+        if not routines:
+            print('[MCP-DEBUG] getSymbols() returned no routines.')
+            return []
+
+        for r in routines:
+            address, name = None, None
+            try:
+                # Defensively get address
+                if hasattr(r, 'getAddress'):
+                    address = str(r.getAddress())
+            except Exception as e:
+                print('[MCP-ERROR] Could not get address for a symbol: %s' % e)
+
+            try:
+                # Defensively get name
+                if hasattr(r, 'getName'):
+                    name = r.getName()
+            except Exception as e:
+                print('[MCP-ERROR] Could not get name for a symbol: %s' % e)
+
+            # If name could not be retrieved, create a placeholder
+            if not name and address:
+                name = "sub_" + address.lstrip("L")
+
+            if address and name:
                 functions.append({
-                    'address': str(method.getAddress()),
-                    'name': method.getName(),
-                    'signature': method.getSignature(),
-                    'size': method.getCodeSize() if hasattr(method, 'getCodeSize') else 0
+                    'address': address,
+                    'name': name
                 })
-            return functions
+
+        return functions
     except Exception as e:
         print('Error getting native functions: %s' % str(e))
+        traceback.print_exc()
     
     return []
 
@@ -691,7 +737,7 @@ def decompile_native_function(filepath, lib_name, function_address):
         return None
     
     try:
-        unit = get_native_unit(apk, lib_name)
+        unit = get_native_unit(apk, lib_name) # This gets the imageUnit
         if unit:
             # Get decompiler for native code
             decomp = DecompilerHelper.getDecompiler(unit)
@@ -700,46 +746,69 @@ def decompile_native_function(filepath, lib_name, function_address):
             
             # Try to decompile the function at the given address
             try:
-                # Convert address string to long
-                addr = long(function_address, 16) if function_address.startswith('0x') else long(function_address)
+                # Convert address string to long for JEB API
+                addr = long(function_address, 16) if isinstance(function_address, basestring) and function_address.startswith('0x') else long(function_address)
                 
-                if decomp.decompileMethod(addr):
-                    return decomp.getDecompiledMethodText(addr)
+                # Decompile using the method's address (not signature)
+                if decomp.decompile(addr):
+                    # Use getDecompiledText to get the full output
+                    source_unit = decomp.getDecompiledUnit()
+                    if source_unit and hasattr(source_unit, 'getDocument'):
+                         return TextDocumentUtil.getText(source_unit.getDocument())
+                    return "Decompilation successful, but could not retrieve text."
                 else:
                     return "Failed to decompile function at address: %s" % function_address
             except Exception as addr_e:
-                return "Invalid address format: %s" % str(addr_e)
+                return "Invalid address format or decompilation error: %s" % str(addr_e)
                     
     except Exception as e:
         print('Error decompiling native function: %s' % str(e))
         return "Error: %s" % str(e)
     
-    return None
+    return "Could not find native unit or decompiler."
 
 @jsonrpc
 def get_native_strings(filepath, lib_name):
-    """Get strings from a native library"""
+    """(Investigative) Get children of the native library unit to find the string table."""
     if not filepath or not lib_name:
-        return None
+        return []
 
     apk = getOrLoadApk(filepath)
     if apk is None:
-        return None
+        return []
     
     try:
-        unit = get_native_unit(apk, lib_name)
-        if unit:
-            strings = []
-            # Get string items from the unit
-            for string_item in unit.getStrings():
-                strings.append({
-                    'address': str(string_item.getAddress()),
-                    'value': string_item.getValue(),
-                    'length': len(string_item.getValue()) if string_item.getValue() else 0
-                })
-            return strings
+        unit = _find_elf_unit(apk, lib_name) # Get the ELF container
+        if unit and hasattr(unit, 'getChildren'):
+            children_info = []
+            children = unit.getChildren()
+            if children:
+                for child in children:
+                    child_info = {
+                        'name': 'N/A',
+                        'type': 'N/A',
+                        'class': 'N/A'
+                    }
+                    try:
+                        if hasattr(child, 'getName'):
+                            child_info['name'] = child.getName()
+                    except: pass
+                    try:
+                        if hasattr(child, 'getFormatType'):
+                            child_info['type'] = str(child.getFormatType())
+                    except: pass
+                    try:
+                        if hasattr(child, 'getClass'):
+                            child_info['class'] = str(child.getClass())
+                    except: pass
+                    children_info.append(child_info)
+            return children_info
+        else:
+            print('[MCP] ELF unit for %s was not found or has no children.' % lib_name)
+
     except Exception as e:
-        print('Error getting native strings: %s' % str(e))
+        print('Error investigating native children: %s' % str(e))
+        traceback.print_exc()
     
     return []
 
@@ -757,6 +826,8 @@ def get_jni_methods(filepath):
     try:
         # Get DEX unit for Java side
         dex_unit = apk.getDex()
+        if not dex_unit:
+            return []
         
         # Look for native methods in Java classes
         for java_class in dex_unit.getClasses():
@@ -786,11 +857,11 @@ def find_native_xrefs(filepath, lib_name, address):
         return None
     
     try:
-        unit = get_native_unit(apk, lib_name)
+        unit = get_native_unit(apk, lib_name) # Gets the imageUnit
         if unit:
             ret = []
             try:
-                addr = long(address, 16) if address.startswith('0x') else long(address)
+                addr = long(address, 16) if isinstance(address, basestring) and address.startswith('0x') else long(address)
                 
                 # Use JEB's cross-reference analysis
                 actionXrefsData = ActionXrefsData()
@@ -801,10 +872,9 @@ def find_native_xrefs(filepath, lib_name, address):
                             'address': str(actionXrefsData.getAddresses()[i]),
                             'details': str(actionXrefsData.getDetails()[i])
                         })
+                return ret
             except Exception as addr_e:
                 return "Invalid address format: %s" % str(addr_e)
-            
-            return ret
             
     except Exception as e:
         print('Error finding native xrefs: %s' % str(e))
@@ -823,19 +893,18 @@ def get_native_imports(filepath, lib_name):
         return None
 
     try:
-        unit = get_native_unit(apk, lib_name)
-        if unit:
+        # Imports are part of the ELF container format
+        unit = _find_elf_unit(apk, lib_name)
+        if unit and hasattr(unit, 'getImportedSymbols'):
             imports = []
-            for imp in unit.getImports():
+            for imp in unit.getImportedSymbols():
                 imports.append({
-                    'name': imp.getName(),
-                    'library': imp.getLibrary() if hasattr(imp, 'getLibrary') else 'unknown',
-                    'address': str(imp.getAddress()) if hasattr(imp, 'getAddress') else None
+                    'name': imp.getName() if hasattr(imp, 'getName') else 'N/A'
                 })
             return imports
-
     except Exception as e:
         print('Error getting native imports: %s' % str(e))
+        traceback.print_exc()
 
     return []
 
@@ -850,19 +919,19 @@ def get_native_exports(filepath, lib_name):
         return None
 
     try:
-        unit = get_native_unit(apk, lib_name)
-        if unit:
+        # Exports are part of the ELF container format
+        unit = _find_elf_unit(apk, lib_name)
+        if unit and hasattr(unit, 'getExportedSymbols'):
             exports = []
-            for exp in unit.getExports():
+            for exp in unit.getExportedSymbols():
                 exports.append({
-                    'name': exp.getName(),
-                    'address': str(exp.getAddress()) if hasattr(exp, 'getAddress') else None,
-                    'ordinal': exp.getOrdinal() if hasattr(exp, 'getOrdinal') else None
+                    'name': exp.getName() if hasattr(exp, 'getName') else 'N/A',
+                    'address': str(exp.getAddress()) if hasattr(exp, 'getAddress') else None
                 })
             return exports
-
     except Exception as e:
         print('Error getting native exports: %s' % str(e))
+        traceback.print_exc()
     
     return []
 
