@@ -1,6 +1,6 @@
 # NOTE: This file has been automatically generated, do not modify!
 # Architecture based on https://github.com/mrexodia/ida-pro-mcp (MIT License)
-from typing import Annotated, Optional, TypedDict, Generic, TypeVar
+from typing import Annotated, Optional, TypedDict, Generic, TypeVar, List, Tuple
 from pydantic import Field
 
 T = TypeVar("T")
@@ -43,7 +43,7 @@ def decompile_class(filepath: str, class_signature: str) -> str:
     return make_jsonrpc_request('get_class_decompiled_code', filepath, class_signature)
 
 @mcp.tool()
-def find_callers(filepath: str, method_signature: str) -> list[(str,str)]:
+def find_callers(filepath: str, method_signature: str) -> List[Tuple[str,str]]:
     """Find all methods calling this method (cross-references)
     
     Args:
@@ -56,7 +56,7 @@ def find_callers(filepath: str, method_signature: str) -> list[(str,str)]:
     return make_jsonrpc_request('get_method_callers', filepath, method_signature)
 
 @mcp.tool()
-def find_overrides(filepath: str, method_signature: str) -> list[(str,str)]:
+def find_overrides(filepath: str, method_signature: str) -> List[Tuple[str,str]]:
     """Find all methods overriding this method
     
     Args:
@@ -95,14 +95,14 @@ def load_native_lib(filepath: str, lib_name: str) -> dict:
 
 @mcp.tool()
 def native_functions(filepath: str, lib_name: str) -> list:
-    """Get list of functions in native library
+    """Get list of exported functions in a native library.
     
     Args:
         filepath: Absolute path to the APK file
         lib_name: Name of the native library
         
     Returns:
-        List of functions with addresses, names, signatures, and sizes
+        List of functions with their addresses and names.
     """
     return make_jsonrpc_request('get_native_functions', filepath, lib_name)
 
@@ -122,14 +122,14 @@ def decompile_native(filepath: str, lib_name: str, function_address: str) -> str
 
 @mcp.tool()
 def native_strings(filepath: str, lib_name: str) -> list:
-    """Get strings from native library
+    """Get all printable strings from a native library.
     
     Args:
         filepath: Absolute path to the APK file
         lib_name: Name of the native library
         
     Returns:
-        List of strings with addresses, values, and lengths
+        A list of strings found in the library's string table sections.
     """
     return make_jsonrpc_request('get_native_strings', filepath, lib_name)
 

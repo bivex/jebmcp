@@ -666,7 +666,7 @@ def load_native_library(filepath, lib_name):
 
 @jsonrpc
 def get_native_functions(filepath, lib_name):
-    """Get list of functions in a native library"""
+    """Get list of functions from the exported symbols of a native library."""
     if not filepath or not lib_name:
         return None
 
@@ -675,43 +675,37 @@ def get_native_functions(filepath, lib_name):
         return None
     
     try:
-        # Symbols are on the ELF container unit, not the image unit.
+        # Exported functions are on the ELF container unit.
         unit = _find_elf_unit(apk, lib_name) 
         if not unit:
             return []
 
         functions = []
         
-        # We know from the dump that the ELF unit has getSymbols()
-        if hasattr(unit, 'getSymbols'):
-            routines = unit.getSymbols()
+        # We use getExportedSymbols, as this was shown to contain the function names.
+        if hasattr(unit, 'getExportedSymbols'):
+            routines = unit.getExportedSymbols()
         else:
-            print('[MCP-ERROR] The ELF unit does not have a getSymbols() method.')
+            print('[MCP-ERROR] The ELF unit does not have a getExportedSymbols() method.')
             return []
         
         if not routines:
-            print('[MCP-DEBUG] getSymbols() returned no routines.')
+            print('[MCP-DEBUG] getExportedSymbols() returned no routines.')
             return []
 
         for r in routines:
             address, name = None, None
             try:
-                # Defensively get address
                 if hasattr(r, 'getAddress'):
                     address = str(r.getAddress())
             except Exception as e:
                 print('[MCP-ERROR] Could not get address for a symbol: %s' % e)
 
             try:
-                # Defensively get name
                 if hasattr(r, 'getName'):
                     name = r.getName()
             except Exception as e:
                 print('[MCP-ERROR] Could not get name for a symbol: %s' % e)
-
-            # If name could not be retrieved, create a placeholder
-            if not name and address:
-                name = "sub_" + address.lstrip("L")
 
             if address and name:
                 functions.append({
@@ -769,7 +763,7 @@ def decompile_native_function(filepath, lib_name, function_address):
 
 @jsonrpc
 def get_native_strings(filepath, lib_name):
-    """(Investigative) Get children of the native library unit to find the string table."""
+    """Get strings from a native library by reading its string table sections."""
     if not filepath or not lib_name:
         return []
 
@@ -779,35 +773,47 @@ def get_native_strings(filepath, lib_name):
     
     try:
         unit = _find_elf_unit(apk, lib_name) # Get the ELF container
-        if unit and hasattr(unit, 'getChildren'):
-            children_info = []
-            children = unit.getChildren()
-            if children:
-                for child in children:
-                    child_info = {
-                        'name': 'N/A',
-                        'type': 'N/A',
-                        'class': 'N/A'
-                    }
-                    try:
-                        if hasattr(child, 'getName'):
-                            child_info['name'] = child.getName()
-                    except: pass
-                    try:
-                        if hasattr(child, 'getFormatType'):
-                            child_info['type'] = str(child.getFormatType())
-                    except: pass
-                    try:
-                        if hasattr(child, 'getClass'):
-                            child_info['class'] = str(child.getClass())
-                    except: pass
-                    children_info.append(child_info)
-            return children_info
-        else:
-            print('[MCP] ELF unit for %s was not found or has no children.' % lib_name)
+        if not unit or not hasattr(unit, 'getSections'):
+            return []
+        
+        all_strings = []
+        sections = unit.getSections()
+        if not sections:
+            return []
+
+        for section in sections:
+            name = section.getName() if hasattr(section, 'getName') else ''
+            
+            # Target common string-containing sections
+            if name in ['.rodata', '.rdata', '.strings', '.strtab', '.dynstr']:
+                print("[MCP-DEBUG] Reading strings from section: %s" % name)
+                if hasattr(section, 'getData'):
+                    data_obj = section.getData()
+                    if data_obj and hasattr(data_obj, 'getSize') and hasattr(data_obj, 'read'):
+                        raw_bytes = data_obj.read(0, data_obj.getSize())
+                        
+                        # Find null-terminated ASCII strings
+                        current_string = ""
+                        for byte in raw_bytes:
+                            if byte == '\x00':
+                                # Min length 4 to filter out garbage
+                                if len(current_string) > 3:
+                                    all_strings.append(current_string)
+                                current_string = ""
+                            else:
+                                # Check for printable characters
+                                if 32 <= ord(byte) <= 126:
+                                    current_string += byte
+                                else:
+                                    if len(current_string) > 3:
+                                        all_strings.append(current_string)
+                                    current_string = ""
+
+        # Return unique strings
+        return list(set(all_strings))
 
     except Exception as e:
-        print('Error investigating native children: %s' % str(e))
+        print('Error reading native strings from sections: %s' % str(e))
         traceback.print_exc()
     
     return []
