@@ -608,19 +608,87 @@ def _find_elf_unit(apk, lib_name):
     print('[MCP] ELF unit not found after full check: %s' % lib_name)
     return None
 
-def get_native_unit(apk, lib_name):
-    """Find a native code IMAGE unit by name in an APK unit."""
+def _get_native_code_unit(apk, lib_name):
+    """Finds the ELF container and returns the primary native code unit within it."""
     elf_unit = _find_elf_unit(apk, lib_name)
-    if elf_unit:
-        if hasattr(elf_unit, 'getImageUnit'):
-            image_unit = elf_unit.getImageUnit()
-            if image_unit:
-                print('[MCP] Returning image unit from ELF container for %s.' % lib_name)
-                return image_unit
-        print('[MCP] ELF unit for %s has no image unit, returning ELF unit itself.' % lib_name)
-        return elf_unit
+    if not elf_unit:
+        print('[MCP-WARN] _get_native_code_unit: Could not find ELF unit %s' % lib_name)
+        return None
+
+    # The ELF container holds the code unit (e.g., 'arm64 image') as a child.
+    if hasattr(elf_unit, 'getChildren'):
+        for child in elf_unit.getChildren():
+            if isinstance(child, INativeCodeUnit):
+                print('[MCP-DEBUG] Found native code unit: %s' % child.getName())
+                return child
     
-    print('[MCP] Native code unit not found for %s.' % lib_name)
+    # Fallback for older JEB versions or different structures
+    if hasattr(elf_unit, 'getImageUnit'):
+        image_unit = elf_unit.getImageUnit()
+        if image_unit:
+            print('[MCP-DEBUG] Found native code unit via getImageUnit(): %s' % image_unit.getName())
+            return image_unit
+            
+    print('[MCP-WARN] Could not find a native code unit within ELF container: %s' % lib_name)
+    return None
+
+def _get_address_from_name_or_addr(unit, name_or_addr):
+    """Helper to resolve a name or address string to a numerical address."""
+    # If it's already a numeric address, convert it
+    try:
+        if isinstance(name_or_addr, int):
+            return name_or_addr
+        if isinstance(name_or_addr, str):
+            if name_or_addr.startswith('0x'):
+                return int(name_or_addr, 16)
+            if name_or_addr.isdigit():
+                return int(name_or_addr)
+    except (ValueError, TypeError):
+        pass
+
+    # If not a numeric string, treat as a name and find it.
+    print('[MCP-DEBUG] Address "%s" is not numeric, resolving as name.' % name_or_addr)
+    target_name = str(name_or_addr)
+
+    # Search in methods
+    if hasattr(unit, 'getMethods'):
+        for m in unit.getMethods():
+            if hasattr(m, 'getName') and m.getName() == target_name:
+                if hasattr(m, 'getAddress'):
+                    addr = m.getAddress()
+                    print('[MCP-DEBUG] Found name in methods. Raw address from getAddress(): %s (type: %s)' % (addr, type(addr)))
+
+                    # If getAddress() returns a non-numeric string (like the name itself),
+                    # try to get the numeric item ID instead.
+                    if isinstance(addr, str) and not addr.isdigit() and not addr.startswith('0x'):
+                        if hasattr(m, 'getItemId'):
+                            try:
+                                item_id = m.getItemId()
+                                print('[MCP-DEBUG] Address was symbolic. Using getItemId() instead: %s' % item_id)
+                                return item_id
+                            except:
+                                pass # Fall through if getItemId fails
+
+                    # Prevent recursion if address is the same as the name
+                    if str(addr) == target_name:
+                        print('[MCP-WARN] Address of method "%s" is the method name itself. Cannot resolve to numeric address.' % target_name)
+                        return None 
+                    # Recursively call to handle if getAddress() returns a non-numeric string for some reason
+                    return _get_address_from_name_or_addr(unit, str(addr))
+
+    # Search in symbols as a fallback
+    if hasattr(unit, 'getSymbols'):
+        for s in unit.getSymbols():
+            if hasattr(s, 'getName') and s.getName() == target_name:
+                if hasattr(s, 'getAddress'):
+                    addr = s.getAddress()
+                    print('[MCP-DEBUG] Found name in symbols. Address: %s' % addr)
+                    if str(addr) == target_name:
+                         print('[MCP-WARN] Address of symbol "%s" is the symbol name itself. Cannot resolve to numeric address.' % target_name)
+                         return None
+                    return _get_address_from_name_or_addr(unit, str(addr))
+
+    print('[MCP-WARN] Could not resolve name "%s" to an address.' % target_name)
     return None
 
 @jsonrpc
@@ -634,27 +702,28 @@ def load_native_library(filepath, lib_name):
         return None
     
     try:
-        elf_unit = _find_elf_unit(apk, lib_name)
-        if elf_unit:
-            # The code unit is the 'image' inside the ELF container
-            code_unit = elf_unit.getImageUnit() if hasattr(elf_unit, 'getImageUnit') else elf_unit
-
+        # Use the new helper to get the code unit directly
+        code_unit = _get_native_code_unit(apk, lib_name)
+        if code_unit:
             info = {
-                'name': elf_unit.getName() if hasattr(elf_unit, 'getName') else lib_name,
-                'type': str(elf_unit.getFormatType()),
+                'name': code_unit.getName() if hasattr(code_unit, 'getName') else lib_name,
+                'type': str(code_unit.getFormatType()),
                 'architecture': 'unknown',
                 'entry_point': 'N/A',
                 'base_address': 'N/A'
             }
 
-            if code_unit and hasattr(code_unit, 'getProcessor'):
+            if hasattr(code_unit, 'getProcessor'):
                 info['architecture'] = str(code_unit.getProcessor())
             
-            if code_unit and hasattr(code_unit, 'getEntryPoint') and code_unit.getEntryPoint():
-                info['entry_point'] = str(code_unit.getEntryPoint())
-            
-            if code_unit and hasattr(code_unit, 'getImageBase'):
-                info['base_address'] = str(code_unit.getImageBase())
+            # Use getAddress() on the entry point object
+            if hasattr(code_unit, 'getEntryPoint') and code_unit.getEntryPoint():
+                ep = code_unit.getEntryPoint()
+                if hasattr(ep, 'getAddress'):
+                    info['entry_point'] = str(ep.getAddress())
+
+            if hasattr(code_unit, 'getImageBase'):
+                info['base_address'] = hex(code_unit.getImageBase())
 
             return info
 
@@ -666,8 +735,8 @@ def load_native_library(filepath, lib_name):
 
 @jsonrpc
 def get_native_functions(filepath, lib_name):
-    """Get list of functions from a native library's symbol table."""
-    print('[MCP-DEBUG] --- ENTERING get_native_functions (Symbol Inspection) ---')
+    """Get list of functions from a native library using multiple discovery methods."""
+    print('[MCP-DEBUG] --- ENTERING get_native_functions (Enhanced Function Discovery) ---')
     if not filepath or not lib_name:
         return []
 
@@ -675,57 +744,158 @@ def get_native_functions(filepath, lib_name):
     if apk is None:
         return []
     
-    MAX_FUNCS = 200
-
+    MAX_FUNCS = 500
+    funcs = []
+    
     try:
-        # Get the ELF container unit, which has the symbol tables
-        unit = _find_elf_unit(apk, lib_name)
+        # Get the native code unit
+        unit = _get_native_code_unit(apk, lib_name)
         if not unit:
-            print('[MCP-ERROR] Could not find ELF container for %s' % lib_name)
+            print('[MCP-ERROR] Could not find native code unit for %s' % lib_name)
             return []
-        print('[MCP-DEBUG] Found ELF container unit: %s' % repr(unit))
-
-        funcs = []
         
-        # Use getSymbols(), which is the most reliable method
+        print('[MCP-DEBUG] Found native code unit: %s' % repr(unit))
+        
+        # Method 1: Use getMethods() - most reliable for analyzed code
+        if hasattr(unit, 'getMethods'):
+            try:
+                methods = unit.getMethods()
+                if methods:
+                    print('[MCP-DEBUG] Found %d methods using getMethods()' % len(methods))
+                    for method in methods:
+                        try:
+                            name = method.getName() if hasattr(method, 'getName') else str(method)
+                            addr = str(method.getAddress()) if hasattr(method, 'getAddress') else 'N/A'
+                            
+                            # Filter out empty or invalid names
+                            if name and name.strip() and name != 'N/A':
+                                funcs.append({'name': name, 'address': addr, 'source': 'methods'})
+                                if len(funcs) >= MAX_FUNCS:
+                                    break
+                        except Exception as e:
+                            print('[MCP-DEBUG] Error processing method: %s' % str(e))
+                            
+                    if len(funcs) > 0:
+                        print('[MCP-DEBUG] Success! Found %d functions via getMethods()' % len(funcs))
+                        return funcs
+            except Exception as e:
+                print('[MCP-DEBUG] getMethods() failed: %s' % str(e))
+        
+        # Method 2: Use getRoutines() - alternative method for functions
+        if hasattr(unit, 'getRoutines'):
+            try:
+                routines = unit.getRoutines()
+                if routines:
+                    print('[MCP-DEBUG] Found %d routines using getRoutines()' % len(routines))
+                    for routine in routines:
+                        try:
+                            name = routine.getName() if hasattr(routine, 'getName') else str(routine)
+                            addr = str(routine.getAddress()) if hasattr(routine, 'getAddress') else 'N/A'
+                            
+                            if name and name.strip() and name != 'N/A':
+                                funcs.append({'name': name, 'address': addr, 'source': 'routines'})
+                                if len(funcs) >= MAX_FUNCS:
+                                    break
+                        except Exception as e:
+                            print('[MCP-DEBUG] Error processing routine: %s' % str(e))
+                            
+                    if len(funcs) > 0:
+                        print('[MCP-DEBUG] Success! Found %d functions via getRoutines()' % len(funcs))
+                        return funcs
+            except Exception as e:
+                print('[MCP-DEBUG] getRoutines() failed: %s' % str(e))
+        
+        # Method 3: Enhanced symbol analysis with broader type matching
         if hasattr(unit, 'getSymbols'):
-            symbols = unit.getSymbols()
-            if symbols:
-                print('[MCP-DEBUG] Found %d symbols. Inspecting each one...' % len(symbols))
-                for i, s in enumerate(symbols):
-                    try:
-                        # Defensively get all properties to see what we have
-                        s_name, s_type, s_addr_str = 'N/A', 'N/A', 'N/A'
-                        s_addr_obj = None # Initialize variable to prevent reference errors
-                        
-                        if hasattr(s, 'getName'): s_name = s.getName()
-                        if hasattr(s, 'getType'): s_type = str(s.getType())
-                        if hasattr(s, 'getAddress'): s_addr_obj = s.getAddress()
-                        if s_addr_obj:
-                             s_addr_str = str(s_addr_obj)
-
-                        print('[MCP-DEBUG] Symbol #%d: Name=%s, Type=%s, Address=%s' % (i, s_name, s_type, s_addr_str))
-
-                        # Based on inspection, we need FUNCTION and PTRFUNCTION types
-                        # We will also accept symbols without a valid address, as JEB may not provide one
-                        if s_type in ['FUNCTION', 'PTRFUNCTION']:
-                            if s_name: # Only require a name to add it to the list
-                                funcs.append({'name': str(s_name), 'address': s_addr_str})
-                            if len(funcs) >= MAX_FUNCS: 
-                                print('[MCP-DEBUG] Reached MAX_FUNCS limit.')
-                                break
-                    except Exception as e:
-                        print('[MCP-ERROR] Error processing symbol #%d: %s' % (i, str(e)))
-                
-                if len(funcs) > 0:
-                    print('[MCP-DEBUG] Success! Returning %d functions from symbols.' % len(funcs))
-                    return funcs
-                else:
-                    print('[MCP-WARN] Inspection complete. No symbols of the correct type were found.')
-
-        else:
-            print('[MCP-WARN] Unit does not have getSymbols() method.')
-
+            try:
+                symbols = unit.getSymbols()
+                if symbols:
+                    print('[MCP-DEBUG] Found %d symbols. Using enhanced symbol analysis...' % len(symbols))
+                    for i, s in enumerate(symbols):
+                        try:
+                            s_name = s.getName() if hasattr(s, 'getName') else None
+                            s_type = str(s.getType()) if hasattr(s, 'getType') else 'UNKNOWN'
+                            s_addr_str = str(s.getAddress()) if hasattr(s, 'getAddress') else 'N/A'
+                            
+                            # More comprehensive type matching - include any symbol that looks like a function
+                            is_function = (
+                                'FUNCTION' in s_type.upper() or
+                                'FUNC' in s_type.upper() or
+                                'ROUTINE' in s_type.upper() or
+                                'METHOD' in s_type.upper() or
+                                'PROC' in s_type.upper() or
+                                s_type in ['EXPORT', 'IMPORT', 'SYMBOL']  # Common symbol types that might be functions
+                            )
+                            
+                            # Also check if the symbol name looks like a function (contains parentheses or common prefixes)
+                            if s_name and not is_function:
+                                name_lower = s_name.lower()
+                                is_function = (
+                                    '(' in s_name or
+                                    name_lower.startswith('sub_') or
+                                    name_lower.startswith('loc_') or
+                                    name_lower.startswith('j_') or
+                                    name_lower.startswith('nullsub_') or
+                                    name_lower.startswith('_z') or  # Mangled C++ names
+                                    name_lower.startswith('java_') or
+                                    name_lower.startswith('jni_')
+                                )
+                            
+                            if is_function and s_name and s_name.strip():
+                                funcs.append({
+                                    'name': str(s_name), 
+                                    'address': s_addr_str,
+                                    'type': s_type,
+                                    'source': 'symbols'
+                                })
+                                if len(funcs) >= MAX_FUNCS:
+                                    break
+                                    
+                        except Exception as e:
+                            print('[MCP-DEBUG] Error processing symbol #%d: %s' % (i, str(e)))
+                    
+                    if len(funcs) > 0:
+                        print('[MCP-DEBUG] Success! Found %d functions via enhanced symbol analysis' % len(funcs))
+                        return funcs
+                    else:
+                        print('[MCP-DEBUG] No function symbols found with enhanced matching')
+            except Exception as e:
+                print('[MCP-DEBUG] Enhanced symbol analysis failed: %s' % str(e))
+        
+        # Method 4: Fallback - get all analyzed addresses that might be functions
+        if hasattr(unit, 'getInstructions'):
+            try:
+                print('[MCP-DEBUG] Using fallback method: scanning for function entry points')
+                instructions = unit.getInstructions()
+                if instructions:
+                    # Look for function prologues or entry points
+                    func_candidates = []
+                    for addr in instructions.getAddresses():
+                        try:
+                            insn = instructions.get(addr)
+                            if insn and hasattr(insn, 'getMnemonic'):
+                                mnemonic = insn.getMnemonic()
+                                # Common function prologue patterns
+                                if mnemonic in ['PUSH', 'SUB', 'MOV', 'ENTER']:
+                                    func_candidates.append(addr)
+                                    if len(func_candidates) >= MAX_FUNCS:
+                                        break
+                        except:
+                            continue
+                    
+                    if func_candidates:
+                        for i, addr in enumerate(func_candidates):
+                            funcs.append({
+                                'name': 'sub_%x' % addr,
+                                'address': hex(addr),
+                                'source': 'analysis'
+                            })
+                        print('[MCP-DEBUG] Found %d function candidates via instruction analysis' % len(funcs))
+                        return funcs
+            except Exception as e:
+                print('[MCP-DEBUG] Instruction analysis failed: %s' % str(e))
+        
+        print('[MCP-DEBUG] All methods failed to find functions')
         return []
         
     except Exception as e:
@@ -734,7 +904,59 @@ def get_native_functions(filepath, lib_name):
         return []
 
 @jsonrpc
-def decompile_native_function(filepath, lib_name, function_address):
+def is_native_unit_processed(filepath, lib_name):
+    """Check if the analysis of a native code unit is complete."""
+    print('[MCP-DEBUG] Checking processing status for %s' % lib_name)
+    try:
+        apk = getOrLoadApk(filepath)
+        if apk is None: return False
+        
+        # We must check the code unit, not the container
+        unit = _get_native_code_unit(apk, lib_name)
+        if not unit:
+            print('[MCP-WARN] is_native_unit_processed: Could not find code unit %s' % lib_name)
+            return False
+
+        # The code unit has a reliable isProcessed() method.
+        if hasattr(unit, 'isProcessed'):
+            status = unit.isProcessed()
+            print('[MCP-DEBUG] Code Unit %s isProcessed() returned: %s' % (unit.getName(), status))
+            return status
+        else:
+            print('[MCP-WARN] Code Unit %s does not have an isProcessed() method.' % unit.getName())
+            return False
+            
+    except Exception as e:
+        print('[MCP-ERROR] is_native_unit_processed: Unhandled exception: %s' % str(e))
+        return False
+
+@jsonrpc
+def process_native_unit(filepath, lib_name):
+    """Programmatically start the analysis of a native code unit."""
+    print('[MCP-DEBUG] Attempting to start processing for %s' % lib_name)
+    try:
+        apk = getOrLoadApk(filepath)
+        if apk is None: return False
+        
+        unit = _get_native_code_unit(apk, lib_name)
+        if not unit:
+            print('[MCP-WARN] process_native_unit: Could not find unit %s' % lib_name)
+            return False
+
+        # The unit has a process() method to kick off analysis.
+        if hasattr(unit, 'process'):
+            print('[MCP-DEBUG] Calling process() on unit %s...' % lib_name)
+            unit.process()
+            return True
+        else:
+            print('[MCP-ERROR] Unit %s does not have a process() method.' % lib_name)
+            return False
+    except Exception as e:
+        print('[MCP-ERROR] process_native_unit: Unhandled exception: %s' % str(e))
+        return False
+
+@jsonrpc
+def decompile_native(filepath, lib_name, function_address):
     """Decompile a native function to C-like pseudocode"""
     if not filepath or not lib_name or not function_address:
         return None
@@ -744,32 +966,42 @@ def decompile_native_function(filepath, lib_name, function_address):
         return None
     
     try:
-        unit = get_native_unit(apk, lib_name) # This gets the imageUnit
-        if unit:
-            # Get decompiler for native code
-            decomp = DecompilerHelper.getDecompiler(unit)
-            if not decomp:
-                return "Decompiler not available for this native unit"
+        unit = _get_native_code_unit(apk, lib_name)
+        if not unit:
+            return "Could not find native code unit: %s" % lib_name
             
-            # Try to decompile the function at the given address
-            try:
-                # Convert address string to long for JEB API
-                addr = long(function_address, 16) if isinstance(function_address, basestring) and function_address.startswith('0x') else long(function_address)
-                
-                # Decompile using the method's address (not signature)
-                if decomp.decompile(addr):
-                    # Use getDecompiledText to get the full output
-                    source_unit = decomp.getDecompiledUnit()
-                    if source_unit and hasattr(source_unit, 'getDocument'):
-                         return TextDocumentUtil.getText(source_unit.getDocument())
-                    return "Decompilation successful, but could not retrieve text."
-                else:
-                    return "Failed to decompile function at address: %s" % function_address
-            except Exception as addr_e:
-                return "Invalid address format or decompilation error: %s" % str(addr_e)
+        decomp = DecompilerHelper.getDecompiler(unit)
+        if not decomp:
+            return "Decompiler not available for this native unit"
+        
+        # Find the method item (IMethod) by its name
+        target_method = None
+        if hasattr(unit, 'getMethods'):
+            for m in unit.getMethods():
+                # Use str() to handle potential unicode issues safely
+                if str(m.getName()) == str(function_address):
+                    target_method = m
+                    print('[MCP-DEBUG] Found method item for decompilation: %s' % target_method)
+                    break
+        
+        if target_method is None:
+            return "Could not find a method item for function: %s" % function_address
+
+        # Decompile using the method item itself, which is a valid INativeItem
+        if decomp.decompile(target_method):
+            source_unit = decomp.getDecompiledUnit()
+            if source_unit and hasattr(source_unit, 'getDocument'):
+                    return TextDocumentUtil.getText(source_unit.getDocument())
+            return "Decompilation successful, but could not retrieve text."
+        else:
+            # Check for a common error when trying to decompile an imported/external function
+            if target_method and not target_method.isInternal():
+                return "Decompilation failed: Cannot decompile an external or imported function."
+            return "Failed to decompile function: %s" % function_address
                     
     except Exception as e:
         print('Error decompiling native function: %s' % str(e))
+        traceback.print_exc()
         return "Error: %s" % str(e)
     
     return "Could not find native unit or decompiler."
@@ -784,59 +1016,55 @@ def get_native_strings(filepath, lib_name):
     if apk is None:
         return []
     
+    all_strings = []
     try:
-        unit = _find_elf_unit(apk, lib_name) # Get the ELF container
-        if not unit or not hasattr(unit, 'getSections'):
-            return []
-        
-        all_strings = []
-        sections = unit.getSections()
-        if not sections:
+        # To robustly find strings, we find the container unit for the library
+        # and iterate through all of its sections, not just the processed code unit.
+        elf_unit = _find_elf_unit(apk, lib_name)
+        if not elf_unit:
+            print('[MCP-ERROR] get_native_strings: Could not find ELF container unit for %s' % lib_name)
             return []
 
-        for section in sections:
-            name = section.getName() if hasattr(section, 'getName') else ''
+        if not hasattr(elf_unit, 'getSections'):
+            print('[MCP-WARN] get_native_strings: ELF unit has no getSections method.')
+            return []
             
-            # Target common string-containing sections
-            if name in ['.rodata', '.rdata', '.strings', '.strtab', '.dynstr']:
-                print("[MCP-DEBUG] Reading strings from section: %s" % name)
-                if hasattr(section, 'getData'):
-                    data_obj = section.getData()
-                    if data_obj and hasattr(data_obj, 'getSize') and hasattr(data_obj, 'read'):
-                        raw_bytes = data_obj.read(0, data_obj.getSize())
-                        
-                        # Find null-terminated ASCII strings
-                        current_string = ""
-                        for byte in raw_bytes:
-                            if byte == '\x00':
-                                # Min length 4 to filter out garbage
-                                if len(current_string) > 3:
-                                    all_strings.append(current_string)
-                                current_string = ""
-                            else:
-                                # Check for printable characters
-                                if 32 <= ord(byte) <= 126:
-                                    current_string += byte
-                                else:
-                                    if len(current_string) > 3:
-                                        all_strings.append(current_string)
-                                    current_string = ""
+        sections = elf_unit.getSections()
+        if not sections:
+            print('[MCP-WARN] get_native_strings: No sections found in ELF unit.')
+            return []
 
-        # Return unique strings
+        print("[MCP-DEBUG] Iterating all sections in ELF unit to find strings...")
+        for sec in sections:
+            sec_name = sec.getName() if hasattr(sec, 'getName') else 'N/A'
+            try:
+                # A section is likely to contain strings if its type indicates it,
+                # or if its name is a common name for a string-containin section.
+                is_str_sec = hasattr(sec, 'isStringSection') and sec.isStringSection()
+                if is_str_sec or sec_name in ['.rodata', '.data', '.strtab', '.dynstr', '.rdata']:
+                    if hasattr(sec, 'getStrings'):
+                        string_list = sec.getStrings()
+                        if string_list:
+                            print("[MCP-DEBUG] Found %d strings in section: %s" % (len(string_list), sec_name))
+                            for s in string_list:
+                                if hasattr(s, 'getValue'):
+                                    all_strings.append(s.getValue())
+                                else: # Fallback
+                                    all_strings.append(str(s))
+            except Exception as e:
+                # Some sections might fail this check, which is fine.
+                print("[MCP-DEBUG] Could not get strings from section %s: %s" % (sec_name, e))
+
         return list(set(all_strings))
 
     except Exception as e:
-        print('Error reading native strings from sections: %s' % str(e))
+        print('Error reading native strings: %s' % str(e))
         traceback.print_exc()
-    
-    return []
+        return []
 
 @jsonrpc
 def find_native_xrefs(filepath, lib_name, address):
-    """Find cross-references to a given native address.
-    
-    This function is not provided in the original file or the code block.
-    """
+    """Find cross-references to a given native address."""
     if not filepath or not lib_name or not address:
         return None
 
@@ -845,83 +1073,136 @@ def find_native_xrefs(filepath, lib_name, address):
         return None
     
     try:
-        unit = get_native_unit(apk, lib_name) # Gets the imageUnit
-        if unit:
-            ret = []
-            try:
-                addr = long(address, 16) if isinstance(address, basestring) and address.startswith('0x') else long(address)
-                
-                # Use JEB's cross-reference analysis
-                actionXrefsData = ActionXrefsData()
-                actionContext = ActionContext(unit, Actions.QUERY_XREFS, addr, None)
-                if unit.prepareExecution(actionContext, actionXrefsData):
-                    for i in range(actionXrefsData.getAddresses().size()):
-                        ret.append({
-                            'address': str(actionXrefsData.getAddresses()[i]),
-                            'details': str(actionXrefsData.getDetails()[i])
-                        })
-                return ret
-            except Exception as addr_e:
-                return "Invalid address format: %s" % str(addr_e)
+        unit = _get_native_code_unit(apk, lib_name)
+        if not unit:
+            return "Could not find native unit for xrefs: %s" % lib_name
+            
+        ret = []
+        
+        # Find the method item (IMethod) by its name or address to get its ID
+        target_item_id = None
+        
+        # Resolve name or address to a numerical address first
+        resolved_addr = _get_address_from_name_or_addr(unit, address)
+        if resolved_addr is None:
+            return "Could not resolve address or name: %s" % address
+
+        # Use JEB's cross-reference analysis with the resolved address/ID
+        actionXrefsData = ActionXrefsData()
+        # The third argument to ActionContext is the item ID or address
+        actionContext = ActionContext(unit, Actions.QUERY_XREFS, resolved_addr, None)
+        
+        print('[MCP-DEBUG] Querying xrefs for item at address/id: %s' % resolved_addr)
+        if unit.prepareExecution(actionContext, actionXrefsData):
+            print('[MCP-DEBUG] Found %d xrefs.' % actionXrefsData.getAddresses().size())
+            for i in range(actionXrefsData.getAddresses().size()):
+                ret.append({
+                    'address': str(actionXrefsData.getAddresses()[i]),
+                    'details': str(actionXrefsData.getDetails()[i])
+                })
+        else:
+            print('[MCP-DEBUG] prepareExecution for xrefs returned False.')
+
+        return ret
             
     except Exception as e:
         print('Error finding native xrefs: %s' % str(e))
+        traceback.print_exc()
         return "Error: %s" % str(e)
-
-    return []
 
 @jsonrpc
 def get_native_imports(filepath, lib_name):
-    """Get imported functions/libraries for native library"""
+    """Get imported functions/libraries for native library by parsing symbol tables."""
     if not filepath or not lib_name:
-        return None
+        return []
 
     apk = getOrLoadApk(filepath)
-    if apk is None:
-        return None
+    if apk is None: return []
 
+    imports = []
     try:
-        # Imports are part of the ELF container format
-        unit = _find_elf_unit(apk, lib_name)
-        if unit and hasattr(unit, 'getImportedSymbols'):
-            imports = []
-            for imp in unit.getImportedSymbols():
-                imports.append({
-                    'name': imp.getName() if hasattr(imp, 'getName') else 'N/A'
-                })
-            return imports
+        elf_unit = _find_elf_unit(apk, lib_name)
+        if not elf_unit or not hasattr(elf_unit, 'getSections'):
+            return []
+
+        for sec in elf_unit.getSections():
+            sec_name = sec.getName() if hasattr(sec, 'getName') else ''
+            # Dynamic symbols section is the primary place for imports
+            if sec_name == '.dynsym' and hasattr(sec, 'getSymbols'):
+                print('[MCP-DEBUG] Parsing .dynsym section for imports...')
+                for sym in sec.getSymbols():
+                    # An undefined (UND) symbol in the dynamic table is an import
+                    if hasattr(sym, 'isUndefined') and sym.isUndefined():
+                        imports.append({
+                            'name': sym.getName(),
+                            'address': 'N/A' # Imports don't have an address in this context
+                        })
+        
+        # If .dynsym didn't yield results, check the static symbol table as a fallback.
+        if not imports:
+             for sec in elf_unit.getSections():
+                sec_name = sec.getName() if hasattr(sec, 'getName') else ''
+                if sec_name == '.symtab' and hasattr(sec, 'getSymbols'):
+                    print('[MCP-DEBUG] Parsing .symtab section for imports...')
+                    for sym in sec.getSymbols():
+                        if hasattr(sym, 'isUndefined') and sym.isUndefined():
+                            imports.append({'name': sym.getName(), 'address': 'N/A'})
+
     except Exception as e:
         print('Error getting native imports: %s' % str(e))
         traceback.print_exc()
 
-    return []
+    if not imports:
+        print('[MCP-WARN] Found no imports for %s after trying all methods.' % lib_name)
+    else:
+        print('[MCP-INFO] Found %d imports for %s.' % (len(imports), lib_name))
+
+    return imports
 
 @jsonrpc
 def get_native_exports(filepath, lib_name):
-    """Get exported functions from native library"""
+    """Get exported functions from native library by parsing symbol tables."""
     if not filepath or not lib_name:
-        return None
+        return []
 
     apk = getOrLoadApk(filepath)
-    if apk is None:
-        return None
+    if apk is None: return []
 
+    exports = []
     try:
-        # Exports are part of the ELF container format
-        unit = _find_elf_unit(apk, lib_name)
-        if unit and hasattr(unit, 'getExportedSymbols'):
-            exports = []
-            for exp in unit.getExportedSymbols():
-                exports.append({
-                    'name': exp.getName() if hasattr(exp, 'getName') else 'N/A',
-                    'address': str(exp.getAddress()) if hasattr(exp, 'getAddress') else None
-                })
-            return exports
+        elf_unit = _find_elf_unit(apk, lib_name)
+        if not elf_unit or not hasattr(elf_unit, 'getSections'):
+            return []
+
+        # Exports are typically found in the .dynsym (dynamic) or .symtab (static) sections
+        for sec in elf_unit.getSections():
+            sec_name = sec.getName() if hasattr(sec, 'getName') else ''
+            if sec_name in ['.dynsym', '.symtab'] and hasattr(sec, 'getSymbols'):
+                print('[MCP-DEBUG] Parsing %s section for exports...' % sec_name)
+                for sym in sec.getSymbols():
+                    # Exports are defined symbols with global binding
+                    is_defined = not (hasattr(sym, 'isUndefined') and sym.isUndefined())
+                    is_global = hasattr(sym, 'isGlobal') and sym.isGlobal()
+                    
+                    if is_defined and is_global:
+                        exports.append({
+                            'name': sym.getName(),
+                            'address': hex(sym.getValue()) if hasattr(sym, 'getValue') else 'N/A'
+                        })
+
     except Exception as e:
         print('Error getting native exports: %s' % str(e))
         traceback.print_exc()
     
-    return []
+    if not exports:
+        print('[MCP-WARN] Found no exports for %s after trying all methods.' % lib_name)
+    else:
+        # Use set to get unique exports, as symbols can appear in both tables
+        unique_exports = list({v['name']:v for v in exports}.values())
+        print('[MCP-INFO] Found %d unique exports for %s.' % (len(unique_exports), lib_name))
+        return unique_exports
+
+    return exports
 
 @jsonrpc
 def get_all_units(filepath):

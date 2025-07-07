@@ -118,7 +118,7 @@ def decompile_native(filepath: str, lib_name: str, function_address: str) -> str
     Returns:
         Decompiled C-like pseudocode
     """
-    return make_jsonrpc_request('decompile_native_function', filepath, lib_name, function_address)
+    return make_jsonrpc_request('decompile_native', filepath, lib_name, function_address)
 
 @mcp.tool()
 def native_strings(filepath: str, lib_name: str) -> list:
@@ -172,3 +172,31 @@ def native_exports(filepath: str, lib_name: str) -> list:
         List of exported functions with names, addresses, and ordinals
     """
     return make_jsonrpc_request('get_native_exports', filepath, lib_name)
+
+@mcp.tool()
+def is_native_unit_processed(filepath: str, lib_name: str) -> bool:
+    """Check if the analysis of a native code unit is complete.
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        
+    Returns:
+        True if analysis is complete, False otherwise.
+    """
+    return make_jsonrpc_request('is_native_unit_processed', filepath, lib_name)
+
+@mcp.tool()
+def process_native_unit(filepath: str, lib_name: str) -> bool:
+    """Explicitly starts the analysis of a native code unit.
+    
+    This is equivalent to double-clicking the unit in the UI.
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        
+    Returns:
+        True if processing was started, False otherwise.
+    """
+    return make_jsonrpc_request('process_native_unit', filepath, lib_name)
