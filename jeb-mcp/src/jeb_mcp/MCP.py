@@ -485,12 +485,18 @@ def get_native_libraries(filepath):
 
     apk = getOrLoadApk(filepath)
     if apk is None:
+        print('[MCP] getOrLoadApk returned None, cannot find APK unit.')
         return None
     
     native_libs = []
     try:
+        children = apk.getChildren()
+        print('[MCP] Found %d children for APK' % len(children))
         # Get all native units from the APK
-        for unit in apk.getChildren():
+        for i, unit in enumerate(children):
+            unit_name = unit.getName()
+            unit_type = unit.getFormatType()
+            print('[MCP] Child %d: Name=%s, Type=%s, IsNative=%s' % (i, unit_name, unit_type, isinstance(unit, INativeCodeUnit)))
             if isinstance(unit, INativeCodeUnit):
                 native_libs.append({
                     'name': unit.getName(),
@@ -500,6 +506,7 @@ def get_native_libraries(filepath):
     except Exception as e:
         print('Error getting native libraries: %s' % str(e))
     
+    print('[MCP] Found %d native libraries' % len(native_libs))
     return native_libs
 
 @jsonrpc
@@ -748,6 +755,31 @@ def get_native_exports(filepath, lib_name):
         print('Error getting native exports: %s' % str(e))
     
     return []
+
+@jsonrpc
+def get_all_units(filepath):
+    """Get all units and subunits for a given APK, for debugging."""
+    if not filepath:
+        return []
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return []
+    
+    units_info = []
+    
+    def collect_units(unit, depth=0):
+        units_info.append({
+            'name': unit.getName(),
+            'type': unit.getFormatType(),
+            'class': str(unit.getClass()),
+            'depth': depth
+        })
+        for subunit in unit.getChildren():
+            collect_units(subunit, depth + 1)
+            
+    collect_units(apk)
+    return units_info
 
 CTX = None
 
