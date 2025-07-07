@@ -18,6 +18,7 @@ from com.pnfsoftware.jeb.core.util import DecompilerHelper
 from com.pnfsoftware.jeb.core.units.code.android import IApkUnit
 from com.pnfsoftware.jeb.core.output.text import TextDocumentUtil
 from com.pnfsoftware.jeb.core.units.code.asm.decompiler import INativeSourceUnit
+from com.pnfsoftware.jeb.core.actions import ActionContext, Actions, ActionXrefsData, ActionOverridesData
 from java.io import File
 
 import json
@@ -25,6 +26,7 @@ import struct
 import threading
 import traceback
 import os
+import time
 # Python 2.7 changes - use urlparse from urlparse module instead of urllib.parse
 from urlparse import urlparse
 # Python 2.7 doesn't have typing, so we'll define our own minimal substitutes
@@ -259,20 +261,14 @@ class Server(object):  # Use explicit inheritance from object for py2
 
     def _run_server(self):
         try:
-            # Create server in the thread to handle binding
-            self.server = MCPHTTPServer((Server.HOST, Server.PORT), JSONRPCRequestHandler)
-            print("[MCP] Server started at http://{0}:{1}".format(Server.HOST, Server.PORT))
+            print("[MCP] Starting server on %s:%d" % (self.HOST, self.PORT))
+            self.server = MCPHTTPServer((self.HOST, self.PORT), JSONRPCRequestHandler)
             self.server.serve_forever()
-        except OSError as e:
-            if e.errno == 98 or e.errno == 10048:  # Port already in use (Linux/Windows)
-                print("[MCP] Error: Port 13337 is already in use")
-            else:
-                print("[MCP] Server error: {0}".format(e))
-            self.running = False
         except Exception as e:
-            print("[MCP] Server error: {0}".format(e))
+            print("[MCP] Server error: %s" % str(e))
         finally:
             self.running = False
+            print("[MCP] Server has stopped")
 
 # A module that helps with writing thread safe ida code.
 # Based on:
@@ -282,66 +278,93 @@ import Queue as queue  # Python 2.7 uses Queue instead of queue
 import traceback
 import functools
 
-# implement a FIFO queue to store the artifacts
-artifactQueue = list()
+MAX_OPENED_ARTIFACTS = 5
+artifactQueue = [] # Store up to MAX_OPENED_ARTIFACTS artifacts, then unload the oldest
 
 def addArtifactToQueue(artifact):
-    """Add an artifact to the queue"""
+    """Add an artifact to the queue, and remove the oldest if the queue is full"""
+    global artifactQueue
+    if len(artifactQueue) >= MAX_OPENED_ARTIFACTS:
+        oldestArtifact = artifactQueue.pop(0)
+        print('[MCP] Unloading artifact due to queue size: %s' % oldestArtifact.getName())
+        try:
+            # This is a bit aggressive, but necessary to free resources
+            RuntimeProjectUtil.closeProject(oldestArtifact.getProject())
+        except Exception as e:
+            print('[MCP] Error unloading artifact: %s' % str(e))
+            
     artifactQueue.append(artifact)
 
 def getArtifactFromQueue():
-    """Get an artifact from the queue"""
+    """Get the oldest artifact from the queue"""
+    global artifactQueue
     if len(artifactQueue) > 0:
         return artifactQueue.pop(0)
     return None
 
 def clearArtifactQueue():
-    """Clear the artifact queue"""
+    """Clear all artifacts from the queue"""
     global artifactQueue
-    artifactQueue = list()
-
-MAX_OPENED_ARTIFACTS = 10
+    artifactQueue = []
 
 def getOrLoadApk(filepath):
-    engctx = CTX.getEnginesContext()
+    """Get the APK unit from the current project or load it"""
+    global CTX
+    if not CTX:
+        raise Exception("JEB context not available. Please try running the script again.")
 
-    if not engctx:
-        print('Back-end engines not initialized')
-        return
-
-    if not os.path.exists(filepath):
+    if not filepath or not os.path.exists(filepath):
         raise Exception("File not found: %s" % filepath)
-    # Create a project
+
+    engctx = CTX.getEnginesContext()
+    if not engctx:
+        raise Exception('Back-end engines not initialized')
+
+    # Use a dedicated project for our operations to not pollute the UI
     project = engctx.loadProject('MCPPluginProject')
+    if not project:
+        raise Exception('Failed to load MCP project')
+
     base_name = os.path.basename(filepath)
-    correspondingArtifact = None
+    
+    # Check if artifact is already in our project
     for artifact in project.getLiveArtifacts():
         if artifact.getArtifact().getName() == base_name:
-            # If the artifact is already loaded, return it
-            correspondingArtifact = artifact
-            break
-    if not correspondingArtifact:
-        # try to load the artifact, but first check if the queue size has been exceeded
-        if len(artifactQueue) >= MAX_OPENED_ARTIFACTS:
-            # unload the oldest artifact
-            oldestArtifact = getArtifactFromQueue()
-            if oldestArtifact:
-                # unload the artifact
-                print('Unloading artifact: %s because queue size limit exeeded' % oldestArtifact.getArtifact().getName())
-                RuntimeProjectUtil.destroyLiveArtifact(oldestArtifact)
+            print('[MCP] Found existing artifact: %s' % base_name)
+            unit = artifact.getMainUnit()
+            if isinstance(unit, IApkUnit):
+                print('[MCP] Existing artifact found. Waiting for sub-units to be processed...')
+                time.sleep(5) # Heuristic wait
+                return unit
 
-        correspondingArtifact = project.processArtifact(Artifact(base_name, FileInput(File(filepath))))
-        addArtifactToQueue(correspondingArtifact)
+    # Artifact not found, let's process it
+    print('[MCP] Processing new artifact: %s' % base_name)
+    live_artifact = project.processArtifact(Artifact(base_name, FileInput(File(filepath))))
+    if not live_artifact:
+        raise Exception('Failed to process artifact')
+
+    # Wait for the main unit to be available
+    timeout = 60  # seconds
+    start_time = time.time()
+    unit = live_artifact.getMainUnit()
+    while not unit and (time.time() - start_time) < timeout:
+        time.sleep(1)
+        unit = live_artifact.getMainUnit()
+
+    if not unit:
+        raise Exception('Timed out waiting for main unit to be available')
     
-    unit = correspondingArtifact.getMainUnit()
+    print('[MCP] Main unit is available, waiting for analysis to complete...')
+    time.sleep(15) # Heuristic wait for analysis to populate children units
+
     if isinstance(unit, IApkUnit):
-            # If the unit is already loaded, return it
-            return unit    
-    return None
+        return unit
+    
+    raise Exception('Processed artifact is not an APK unit')
 
 @jsonrpc
 def get_manifest(filepath):
-    """Get the manifest of the given APK file in path, note filepath needs to be an absolute path"""
+    """Get the AndroidManifest.xml content of an APK file"""
     if not filepath:
         return None
 
@@ -489,25 +512,102 @@ def get_native_libraries(filepath):
         return None
     
     native_libs = []
-    try:
-        children = apk.getChildren()
-        print('[MCP] Found %d children for APK' % len(children))
-        # Get all native units from the APK
-        for i, unit in enumerate(children):
-            unit_name = unit.getName()
-            unit_type = unit.getFormatType()
-            print('[MCP] Child %d: Name=%s, Type=%s, IsNative=%s' % (i, unit_name, unit_type, isinstance(unit, INativeCodeUnit)))
-            if isinstance(unit, INativeCodeUnit):
-                native_libs.append({
-                    'name': unit.getName(),
-                    'type': unit.getFormatType(),
-                    'architecture': str(unit.getProcessor())
-                })
-    except Exception as e:
-        print('Error getting native libraries: %s' % str(e))
     
-    print('[MCP] Found %d native libraries' % len(native_libs))
+    # Create a list of units to check, starting with the APK's direct children
+    units_to_check = list(apk.getChildren())
+    
+    # Process units, including children of composite units
+    processed_units = 0
+    while processed_units < len(units_to_check):
+        unit = units_to_check[processed_units]
+        processed_units += 1
+
+        unit_name = ''
+        try:
+            unit_name = unit.getName()
+        except:
+            # Fallback to parsing the string representation
+            try:
+                repr_str = repr(unit)
+                if 'name={' in repr_str:
+                    unit_name = repr_str.split('name={')[1].split('}')[0]
+            except:
+                pass # can't get name
+
+        print('[MCP-DEBUG] Checking unit: %s' % unit_name)
+
+        # Check if it's a native library
+        is_native = 'elf' in str(unit.getFormatType()).lower() or isinstance(unit, INativeCodeUnit)
+        if is_native:
+            print('[MCP-DEBUG] Identified "%s" as a native unit (type: %s).' % (unit_name, unit.getFormatType()))
+            
+            arch = 'unknown'
+            if hasattr(unit, 'getProcessor'):
+                arch = str(unit.getProcessor())
+
+            native_libs.append({
+                'name': unit_name,
+                'type': str(unit.getFormatType()),
+                'architecture': arch
+            })
+
+        # If it's a composite unit (like 'Libraries'), add its children to the list to be checked
+        if hasattr(unit, 'getChildren') and callable(unit.getChildren):
+            try:
+                # Add children to the list to be checked, avoiding infinite loops with self-references
+                children = unit.getChildren()
+                if children:
+                    print('[MCP-DEBUG] Unit "%s" is composite, adding %d children to check queue.' % (unit_name, len(children)))
+                    for child in children:
+                        if child not in units_to_check:
+                            units_to_check.append(child)
+            except Exception as e:
+                print('[MCP-DEBUG] Could not get children for unit %s: %s' % (unit_name, e))
+
+    print('[MCP] Found %d native libraries after full check.' % len(native_libs))
     return native_libs
+
+def get_native_unit(apk, lib_name):
+    """Find a native code unit by name in an APK unit."""
+    if not apk or not lib_name:
+        return None
+
+    units_to_check = list(apk.getChildren())
+    
+    processed_units = 0
+    while processed_units < len(units_to_check):
+        unit = units_to_check[processed_units]
+        processed_units += 1
+
+        unit_name = ''
+        try:
+            unit_name = unit.getName()
+        except:
+            try:
+                repr_str = repr(unit)
+                if 'name={' in repr_str:
+                    unit_name = repr_str.split('name={')[1].split('}')[0]
+            except:
+                pass
+
+        # Check if it's the native library we're looking for
+        is_native = 'elf' in str(unit.getFormatType()).lower() or isinstance(unit, INativeCodeUnit)
+        if is_native and unit_name == lib_name:
+            return unit
+
+        # If it's a composite unit, add its children to the queue
+        if hasattr(unit, 'getChildren') and callable(unit.getChildren):
+            try:
+                children = unit.getChildren()
+                if children:
+                    for child in children:
+                        if child not in units_to_check:
+                            units_to_check.append(child)
+            except:
+                pass # Ignore errors getting children for this purpose
+
+    print('[MCP] Native unit not found after full check: %s' % lib_name)
+    return None
 
 @jsonrpc
 def load_native_library(filepath, lib_name):
@@ -520,18 +620,36 @@ def load_native_library(filepath, lib_name):
         return None
     
     try:
-        # Find the native library unit
-        for unit in apk.getChildren():
-            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
-                return {
-                    'name': unit.getName(),
-                    'type': unit.getFormatType(),
-                    'architecture': str(unit.getProcessor()),
-                    'entry_point': str(unit.getEntryPoint()) if unit.getEntryPoint() else None,
-                    'base_address': str(unit.getImageBase()) if hasattr(unit, 'getImageBase') else None
-                }
+        unit = get_native_unit(apk, lib_name)
+        if unit:
+            unit_name = ''
+            try:
+                unit_name = unit.getName()
+            except:
+                pass # name is not essential here
+
+            arch = 'unknown'
+            if hasattr(unit, 'getProcessor'):
+                arch = str(unit.getProcessor())
+            
+            entry_point = 'N/A'
+            if hasattr(unit, 'getEntryPoint') and unit.getEntryPoint():
+                entry_point = str(unit.getEntryPoint())
+            
+            base_address = 'N/A'
+            if hasattr(unit, 'getImageBase'):
+                base_address = str(unit.getImageBase())
+
+            return {
+                'name': unit_name if unit_name else lib_name,
+                'type': str(unit.getFormatType()),
+                'architecture': arch,
+                'entry_point': entry_point,
+                'base_address': base_address
+            }
     except Exception as e:
         print('Error loading native library: %s' % str(e))
+        traceback.print_exc()
     
     return None
 
@@ -546,18 +664,17 @@ def get_native_functions(filepath, lib_name):
         return None
     
     try:
-        # Find the native library unit
-        for unit in apk.getChildren():
-            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
-                functions = []
-                for method in unit.getMethods():
-                    functions.append({
-                        'address': str(method.getAddress()),
-                        'name': method.getName(),
-                        'signature': method.getSignature(),
-                        'size': method.getCodeSize() if hasattr(method, 'getCodeSize') else 0
-                    })
-                return functions
+        unit = get_native_unit(apk, lib_name)
+        if unit:
+            functions = []
+            for method in unit.getMethods():
+                functions.append({
+                    'address': str(method.getAddress()),
+                    'name': method.getName(),
+                    'signature': method.getSignature(),
+                    'size': method.getCodeSize() if hasattr(method, 'getCodeSize') else 0
+                })
+            return functions
     except Exception as e:
         print('Error getting native functions: %s' % str(e))
     
@@ -574,25 +691,24 @@ def decompile_native_function(filepath, lib_name, function_address):
         return None
     
     try:
-        # Find the native library unit
-        for unit in apk.getChildren():
-            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
-                # Get decompiler for native code
-                decomp = DecompilerHelper.getDecompiler(unit)
-                if not decomp:
-                    return "Decompiler not available for this native unit"
+        unit = get_native_unit(apk, lib_name)
+        if unit:
+            # Get decompiler for native code
+            decomp = DecompilerHelper.getDecompiler(unit)
+            if not decomp:
+                return "Decompiler not available for this native unit"
+            
+            # Try to decompile the function at the given address
+            try:
+                # Convert address string to long
+                addr = long(function_address, 16) if function_address.startswith('0x') else long(function_address)
                 
-                # Try to decompile the function at the given address
-                try:
-                    # Convert address string to long
-                    addr = long(function_address, 16) if function_address.startswith('0x') else long(function_address)
-                    
-                    if decomp.decompileMethod(addr):
-                        return decomp.getDecompiledMethodText(addr)
-                    else:
-                        return "Failed to decompile function at address: %s" % function_address
-                except Exception as addr_e:
-                    return "Invalid address format: %s" % str(addr_e)
+                if decomp.decompileMethod(addr):
+                    return decomp.getDecompiledMethodText(addr)
+                else:
+                    return "Failed to decompile function at address: %s" % function_address
+            except Exception as addr_e:
+                return "Invalid address format: %s" % str(addr_e)
                     
     except Exception as e:
         print('Error decompiling native function: %s' % str(e))
@@ -611,18 +727,17 @@ def get_native_strings(filepath, lib_name):
         return None
     
     try:
-        # Find the native library unit
-        for unit in apk.getChildren():
-            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
-                strings = []
-                # Get string items from the unit
-                for string_item in unit.getStrings():
-                    strings.append({
-                        'address': str(string_item.getAddress()),
-                        'value': string_item.getValue(),
-                        'length': len(string_item.getValue()) if string_item.getValue() else 0
-                    })
-                return strings
+        unit = get_native_unit(apk, lib_name)
+        if unit:
+            strings = []
+            # Get string items from the unit
+            for string_item in unit.getStrings():
+                strings.append({
+                    'address': str(string_item.getAddress()),
+                    'value': string_item.getValue(),
+                    'length': len(string_item.getValue()) if string_item.getValue() else 0
+                })
+            return strings
     except Exception as e:
         print('Error getting native strings: %s' % str(e))
     
@@ -647,7 +762,7 @@ def get_jni_methods(filepath):
         for java_class in dex_unit.getClasses():
             class_sig = java_class.getSignature()
             for method in java_class.getMethods():
-                if method.isNative():
+                if hasattr(method, 'isNative') and method.isNative():
                     jni_methods.append({
                         'java_class': class_sig,
                         'java_method': method.getSignature(),
@@ -671,86 +786,81 @@ def find_native_xrefs(filepath, lib_name, address):
         return None
     
     try:
-        # Find the native library unit
-        for unit in apk.getChildren():
-            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
-                ret = []
-                try:
-                    addr = long(address, 16) if address.startswith('0x') else long(address)
-                    
-                    # Use JEB's cross-reference analysis
-                    actionXrefsData = ActionXrefsData()
-                    actionContext = ActionContext(unit, Actions.QUERY_XREFS, addr, None)
-                    if unit.prepareExecution(actionContext, actionXrefsData):
-                        for i in range(actionXrefsData.getAddresses().size()):
-                            ret.append({
-                                'address': str(actionXrefsData.getAddresses()[i]),
-                                'details': str(actionXrefsData.getDetails()[i])
-                            })
-                except Exception as addr_e:
-                    return "Invalid address format: %s" % str(addr_e)
+        unit = get_native_unit(apk, lib_name)
+        if unit:
+            ret = []
+            try:
+                addr = long(address, 16) if address.startswith('0x') else long(address)
                 
-                return ret
+                # Use JEB's cross-reference analysis
+                actionXrefsData = ActionXrefsData()
+                actionContext = ActionContext(unit, Actions.QUERY_XREFS, addr, None)
+                if unit.prepareExecution(actionContext, actionXrefsData):
+                    for i in range(actionXrefsData.getAddresses().size()):
+                        ret.append({
+                            'address': str(actionXrefsData.getAddresses()[i]),
+                            'details': str(actionXrefsData.getDetails()[i])
+                        })
+            except Exception as addr_e:
+                return "Invalid address format: %s" % str(addr_e)
+            
+            return ret
+            
     except Exception as e:
         print('Error finding native xrefs: %s' % str(e))
-    
+        return "Error: %s" % str(e)
+
     return []
 
 @jsonrpc
 def get_native_imports(filepath, lib_name):
-    """Get imported functions/libraries for a native library"""
+    """Get imported functions/libraries for native library"""
     if not filepath or not lib_name:
         return None
 
     apk = getOrLoadApk(filepath)
     if apk is None:
         return None
-    
+
     try:
-        # Find the native library unit
-        for unit in apk.getChildren():
-            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
-                imports = []
-                
-                # Get import information
-                for imp in unit.getImports():
-                    imports.append({
-                        'name': imp.getName(),
-                        'library': imp.getLibrary() if hasattr(imp, 'getLibrary') else 'unknown',
-                        'address': str(imp.getAddress()) if hasattr(imp, 'getAddress') else None
-                    })
-                
-                return imports
+        unit = get_native_unit(apk, lib_name)
+        if unit:
+            imports = []
+            for imp in unit.getImports():
+                imports.append({
+                    'name': imp.getName(),
+                    'library': imp.getLibrary() if hasattr(imp, 'getLibrary') else 'unknown',
+                    'address': str(imp.getAddress()) if hasattr(imp, 'getAddress') else None
+                })
+            return imports
+
     except Exception as e:
         print('Error getting native imports: %s' % str(e))
-    
+
     return []
 
 @jsonrpc
 def get_native_exports(filepath, lib_name):
-    """Get exported functions from a native library"""
+    """Get exported functions from native library"""
     if not filepath or not lib_name:
         return None
 
     apk = getOrLoadApk(filepath)
     if apk is None:
         return None
-    
+
     try:
-        # Find the native library unit
-        for unit in apk.getChildren():
-            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
-                exports = []
-                
-                # Get export information
-                for exp in unit.getExports():
-                    exports.append({
-                        'name': exp.getName(),
-                        'address': str(exp.getAddress()) if hasattr(exp, 'getAddress') else None,
-                        'ordinal': exp.getOrdinal() if hasattr(exp, 'getOrdinal') else None
-                    })
-                
-                return exports
+        unit = get_native_unit(apk, lib_name)
+        if unit:
+            exports = []
+            for exp in unit.getExports():
+                exports.append({
+                    'name': exp.getName(),
+                    'address': str(exp.getAddress()) if hasattr(exp, 'getAddress') else None,
+                    'ordinal': exp.getOrdinal() if hasattr(exp, 'getOrdinal') else None
+                })
+            return exports
+
     except Exception as e:
         print('Error getting native exports: %s' % str(e))
     
@@ -787,11 +897,19 @@ class MCP(IScript):
 
     def __init__(self):
         self.server = Server()
+        global server
+        server = self.server
+        global CTX
+        CTX = None
         print("[MCP] Plugin loaded")
 
     def run(self, ctx):
-        global CTX  # Fixed: use global keyword to modify global variable
+        """
+        This is the entrypoint of the script.
+        """
+        global CTX
         CTX = ctx
+        print('[MCP] Starting MCP server...')
         self.server.start()
         print("[MCP] Plugin running")
 
