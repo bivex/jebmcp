@@ -666,59 +666,72 @@ def load_native_library(filepath, lib_name):
 
 @jsonrpc
 def get_native_functions(filepath, lib_name):
-    """Get list of functions from the exported symbols of a native library."""
+    """Get list of functions from a native library's symbol table."""
+    print('[MCP-DEBUG] --- ENTERING get_native_functions (Symbol Inspection) ---')
     if not filepath or not lib_name:
-        return None
+        return []
 
     apk = getOrLoadApk(filepath)
     if apk is None:
-        return None
+        return []
     
+    MAX_FUNCS = 200
+
     try:
-        # Exported functions are on the ELF container unit.
-        unit = _find_elf_unit(apk, lib_name) 
+        # Get the ELF container unit, which has the symbol tables
+        unit = _find_elf_unit(apk, lib_name)
         if not unit:
+            print('[MCP-ERROR] Could not find ELF container for %s' % lib_name)
             return []
+        print('[MCP-DEBUG] Found ELF container unit: %s' % repr(unit))
 
-        functions = []
+        funcs = []
         
-        # We use getExportedSymbols, as this was shown to contain the function names.
-        if hasattr(unit, 'getExportedSymbols'):
-            routines = unit.getExportedSymbols()
+        # Use getSymbols(), which is the most reliable method
+        if hasattr(unit, 'getSymbols'):
+            symbols = unit.getSymbols()
+            if symbols:
+                print('[MCP-DEBUG] Found %d symbols. Inspecting each one...' % len(symbols))
+                for i, s in enumerate(symbols):
+                    try:
+                        # Defensively get all properties to see what we have
+                        s_name, s_type, s_addr_str = 'N/A', 'N/A', 'N/A'
+                        s_addr_obj = None # Initialize variable to prevent reference errors
+                        
+                        if hasattr(s, 'getName'): s_name = s.getName()
+                        if hasattr(s, 'getType'): s_type = str(s.getType())
+                        if hasattr(s, 'getAddress'): s_addr_obj = s.getAddress()
+                        if s_addr_obj:
+                             s_addr_str = str(s_addr_obj)
+
+                        print('[MCP-DEBUG] Symbol #%d: Name=%s, Type=%s, Address=%s' % (i, s_name, s_type, s_addr_str))
+
+                        # Based on inspection, we need FUNCTION and PTRFUNCTION types
+                        # We will also accept symbols without a valid address, as JEB may not provide one
+                        if s_type in ['FUNCTION', 'PTRFUNCTION']:
+                            if s_name: # Only require a name to add it to the list
+                                funcs.append({'name': str(s_name), 'address': s_addr_str})
+                            if len(funcs) >= MAX_FUNCS: 
+                                print('[MCP-DEBUG] Reached MAX_FUNCS limit.')
+                                break
+                    except Exception as e:
+                        print('[MCP-ERROR] Error processing symbol #%d: %s' % (i, str(e)))
+                
+                if len(funcs) > 0:
+                    print('[MCP-DEBUG] Success! Returning %d functions from symbols.' % len(funcs))
+                    return funcs
+                else:
+                    print('[MCP-WARN] Inspection complete. No symbols of the correct type were found.')
+
         else:
-            print('[MCP-ERROR] The ELF unit does not have a getExportedSymbols() method.')
-            return []
+            print('[MCP-WARN] Unit does not have getSymbols() method.')
+
+        return []
         
-        if not routines:
-            print('[MCP-DEBUG] getExportedSymbols() returned no routines.')
-            return []
-
-        for r in routines:
-            address, name = None, None
-            try:
-                if hasattr(r, 'getAddress'):
-                    address = str(r.getAddress())
-            except Exception as e:
-                print('[MCP-ERROR] Could not get address for a symbol: %s' % e)
-
-            try:
-                if hasattr(r, 'getName'):
-                    name = r.getName()
-            except Exception as e:
-                print('[MCP-ERROR] Could not get name for a symbol: %s' % e)
-
-            if address and name:
-                functions.append({
-                    'address': address,
-                    'name': name
-                })
-
-        return functions
     except Exception as e:
-        print('Error getting native functions: %s' % str(e))
+        print('[MCP-ERROR] --- Unhandled exception in get_native_functions: %s ---' % str(e))
         traceback.print_exc()
-    
-    return []
+        return []
 
 @jsonrpc
 def decompile_native_function(filepath, lib_name, function_address):
@@ -819,42 +832,11 @@ def get_native_strings(filepath, lib_name):
     return []
 
 @jsonrpc
-def get_jni_methods(filepath):
-    """Get JNI method mappings between Java and native code"""
-    if not filepath:
-        return None
-
-    apk = getOrLoadApk(filepath)
-    if apk is None:
-        return None
-    
-    jni_methods = []
-    try:
-        # Get DEX unit for Java side
-        dex_unit = apk.getDex()
-        if not dex_unit:
-            return []
-        
-        # Look for native methods in Java classes
-        for java_class in dex_unit.getClasses():
-            class_sig = java_class.getSignature()
-            for method in java_class.getMethods():
-                if hasattr(method, 'isNative') and method.isNative():
-                    jni_methods.append({
-                        'java_class': class_sig,
-                        'java_method': method.getSignature(),
-                        'method_name': method.getName(),
-                        'is_native': True,
-                        'jni_name': 'Java_%s_%s' % (class_sig.replace('/', '_').replace(';', '').replace('L', ''), method.getName())
-                    })
-    except Exception as e:
-        print('Error getting JNI methods: %s' % str(e))
-    
-    return jni_methods
-
-@jsonrpc
 def find_native_xrefs(filepath, lib_name, address):
-    """Find cross-references to/from a native address"""
+    """Find cross-references to a given native address.
+    
+    This function is not provided in the original file or the code block.
+    """
     if not filepath or not lib_name or not address:
         return None
 

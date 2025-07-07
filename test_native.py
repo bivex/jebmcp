@@ -83,7 +83,13 @@ def main():
 
             # 4. Decompile a native function (if any found)
             if functions:
-                target_function = functions[0] # Test with the first function
+                # Try to find a specific function for a stable test
+                target_function = next((f for f in functions if 'Java_com_erev0s_jniapp_MainActivity_Jniint' in f.get('name', '')), None)
+                
+                # Fallback to the first function if specific one is not found
+                if not target_function:
+                    target_function = functions[0]
+
                 func_addr = target_function['address']
                 func_name = target_function.get('name', 'N/A')
                 print(f"\n--- Decompiling function: {func_name} at {func_addr} ---")
@@ -104,17 +110,12 @@ def main():
             for s in strings[:10]:
                 print(s.get('value'))
 
-        # 7. Get JNI methods
-        print("\n--- Getting JNI methods ---")
-        jni_methods = make_jsonrpc_request('get_jni_methods', filepath)
-        print(json.dumps(jni_methods, indent=2))
-
-        # 8. Get native imports
+        # 7. Get native imports
         print(f"\n--- Getting imports for {lib_name} ---")
         imports = make_jsonrpc_request('get_native_imports', filepath, lib_name)
         print(json.dumps(imports, indent=2))
 
-        # 9. Get native exports
+        # 8. Get native exports
         print(f"\n--- Getting exports for {lib_name} ---")
         exports = make_jsonrpc_request('get_native_exports', filepath, lib_name)
         print(json.dumps(exports, indent=2))

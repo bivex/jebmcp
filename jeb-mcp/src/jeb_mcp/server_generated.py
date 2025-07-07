@@ -134,18 +134,6 @@ def native_strings(filepath: str, lib_name: str) -> list:
     return make_jsonrpc_request('get_native_strings', filepath, lib_name)
 
 @mcp.tool()
-def jni_methods(filepath: str) -> list:
-    """Get JNI method mappings between Java and native code
-    
-    Args:
-        filepath: Absolute path to the APK file
-        
-    Returns:
-        List of JNI method mappings with Java and native signatures
-    """
-    return make_jsonrpc_request('get_jni_methods', filepath)
-
-@mcp.tool()
 def native_xrefs(filepath: str, lib_name: str, address: str) -> list:
     """Find cross-references to/from native address
     
