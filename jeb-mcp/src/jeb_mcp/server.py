@@ -55,7 +55,10 @@ def make_jsonrpc_request(method: str, *params):
 def check_connection() -> str:
     """Check if the JEB plugin is running"""
     try:
-        metadata = make_jsonrpc_request("ping")
+        # Test connection by attempting to connect to the server
+        conn = http.client.HTTPConnection("localhost", 16161)
+        conn.connect()
+        conn.close()
         return f"Successfully connected to JEB Pro"
     except Exception as e:
         if sys.platform == "darwin":

@@ -282,11 +282,6 @@ import Queue as queue  # Python 2.7 uses Queue instead of queue
 import traceback
 import functools
 
-@jsonrpc
-def ping():
-    """Do a simple ping to check server is alive and running"""
-    return "pong"
-
 # implement a FIFO queue to store the artifacts
 artifactQueue = list()
 
@@ -482,7 +477,280 @@ def get_method_overrides(filepath, method_signature):
             ret.append((data.getAddresses()[i], data.getDetails()[i]))
     return ret
 
+@jsonrpc
+def get_native_libraries(filepath):
+    """Get list of native libraries (.so files) in the APK"""
+    if not filepath:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    native_libs = []
+    try:
+        # Get all native units from the APK
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit):
+                native_libs.append({
+                    'name': unit.getName(),
+                    'type': unit.getFormatType(),
+                    'architecture': str(unit.getProcessor())
+                })
+    except Exception as e:
+        print('Error getting native libraries: %s' % str(e))
+    
+    return native_libs
+
+@jsonrpc
+def load_native_library(filepath, lib_name):
+    """Load and analyze a specific native library from APK"""
+    if not filepath or not lib_name:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    try:
+        # Find the native library unit
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
+                return {
+                    'name': unit.getName(),
+                    'type': unit.getFormatType(),
+                    'architecture': str(unit.getProcessor()),
+                    'entry_point': str(unit.getEntryPoint()) if unit.getEntryPoint() else None,
+                    'base_address': str(unit.getImageBase()) if hasattr(unit, 'getImageBase') else None
+                }
+    except Exception as e:
+        print('Error loading native library: %s' % str(e))
+    
+    return None
+
+@jsonrpc
+def get_native_functions(filepath, lib_name):
+    """Get list of functions in a native library"""
+    if not filepath or not lib_name:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    try:
+        # Find the native library unit
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
+                functions = []
+                for method in unit.getMethods():
+                    functions.append({
+                        'address': str(method.getAddress()),
+                        'name': method.getName(),
+                        'signature': method.getSignature(),
+                        'size': method.getCodeSize() if hasattr(method, 'getCodeSize') else 0
+                    })
+                return functions
+    except Exception as e:
+        print('Error getting native functions: %s' % str(e))
+    
+    return []
+
+@jsonrpc
+def decompile_native_function(filepath, lib_name, function_address):
+    """Decompile a native function to C-like pseudocode"""
+    if not filepath or not lib_name or not function_address:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    try:
+        # Find the native library unit
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
+                # Get decompiler for native code
+                decomp = DecompilerHelper.getDecompiler(unit)
+                if not decomp:
+                    return "Decompiler not available for this native unit"
+                
+                # Try to decompile the function at the given address
+                try:
+                    # Convert address string to long
+                    addr = long(function_address, 16) if function_address.startswith('0x') else long(function_address)
+                    
+                    if decomp.decompileMethod(addr):
+                        return decomp.getDecompiledMethodText(addr)
+                    else:
+                        return "Failed to decompile function at address: %s" % function_address
+                except Exception as addr_e:
+                    return "Invalid address format: %s" % str(addr_e)
+                    
+    except Exception as e:
+        print('Error decompiling native function: %s' % str(e))
+        return "Error: %s" % str(e)
+    
+    return None
+
+@jsonrpc
+def get_native_strings(filepath, lib_name):
+    """Get strings from a native library"""
+    if not filepath or not lib_name:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    try:
+        # Find the native library unit
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
+                strings = []
+                # Get string items from the unit
+                for string_item in unit.getStrings():
+                    strings.append({
+                        'address': str(string_item.getAddress()),
+                        'value': string_item.getValue(),
+                        'length': len(string_item.getValue()) if string_item.getValue() else 0
+                    })
+                return strings
+    except Exception as e:
+        print('Error getting native strings: %s' % str(e))
+    
+    return []
+
+@jsonrpc
+def get_jni_methods(filepath):
+    """Get JNI method mappings between Java and native code"""
+    if not filepath:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    jni_methods = []
+    try:
+        # Get DEX unit for Java side
+        dex_unit = apk.getDex()
+        
+        # Look for native methods in Java classes
+        for java_class in dex_unit.getClasses():
+            class_sig = java_class.getSignature()
+            for method in java_class.getMethods():
+                if method.isNative():
+                    jni_methods.append({
+                        'java_class': class_sig,
+                        'java_method': method.getSignature(),
+                        'method_name': method.getName(),
+                        'is_native': True,
+                        'jni_name': 'Java_%s_%s' % (class_sig.replace('/', '_').replace(';', '').replace('L', ''), method.getName())
+                    })
+    except Exception as e:
+        print('Error getting JNI methods: %s' % str(e))
+    
+    return jni_methods
+
+@jsonrpc
+def find_native_xrefs(filepath, lib_name, address):
+    """Find cross-references to/from a native address"""
+    if not filepath or not lib_name or not address:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    try:
+        # Find the native library unit
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
+                ret = []
+                try:
+                    addr = long(address, 16) if address.startswith('0x') else long(address)
+                    
+                    # Use JEB's cross-reference analysis
+                    actionXrefsData = ActionXrefsData()
+                    actionContext = ActionContext(unit, Actions.QUERY_XREFS, addr, None)
+                    if unit.prepareExecution(actionContext, actionXrefsData):
+                        for i in range(actionXrefsData.getAddresses().size()):
+                            ret.append({
+                                'address': str(actionXrefsData.getAddresses()[i]),
+                                'details': str(actionXrefsData.getDetails()[i])
+                            })
+                except Exception as addr_e:
+                    return "Invalid address format: %s" % str(addr_e)
+                
+                return ret
+    except Exception as e:
+        print('Error finding native xrefs: %s' % str(e))
+    
+    return []
+
+@jsonrpc
+def get_native_imports(filepath, lib_name):
+    """Get imported functions/libraries for a native library"""
+    if not filepath or not lib_name:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    try:
+        # Find the native library unit
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
+                imports = []
+                
+                # Get import information
+                for imp in unit.getImports():
+                    imports.append({
+                        'name': imp.getName(),
+                        'library': imp.getLibrary() if hasattr(imp, 'getLibrary') else 'unknown',
+                        'address': str(imp.getAddress()) if hasattr(imp, 'getAddress') else None
+                    })
+                
+                return imports
+    except Exception as e:
+        print('Error getting native imports: %s' % str(e))
+    
+    return []
+
+@jsonrpc
+def get_native_exports(filepath, lib_name):
+    """Get exported functions from a native library"""
+    if not filepath or not lib_name:
+        return None
+
+    apk = getOrLoadApk(filepath)
+    if apk is None:
+        return None
+    
+    try:
+        # Find the native library unit
+        for unit in apk.getChildren():
+            if isinstance(unit, INativeCodeUnit) and unit.getName() == lib_name:
+                exports = []
+                
+                # Get export information
+                for exp in unit.getExports():
+                    exports.append({
+                        'name': exp.getName(),
+                        'address': str(exp.getAddress()) if hasattr(exp, 'getAddress') else None,
+                        'ordinal': exp.getOrdinal() if hasattr(exp, 'getOrdinal') else None
+                    })
+                
+                return exports
+    except Exception as e:
+        print('Error getting native exports: %s' % str(e))
+    
+    return []
+
 CTX = None
+
 class MCP(IScript):
 
     def __init__(self):

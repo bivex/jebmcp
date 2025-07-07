@@ -1,0 +1,154 @@
+# JEB Pro MCP Tools Documentation
+
+This document provides a comprehensive overview of all available MCP (Model Context Protocol) tools in the JEB Pro MCP Server.
+
+## Overview
+
+The JEB Pro MCP Server provides tools for analyzing Android APK files through JEB Pro's reverse engineering capabilities. The server operates through JSON-RPC communication with the JEB Pro plugin running at `localhost:16161`.
+
+## Available Tools
+
+| Tool Name | Parameters | Return Type | Description | Example Usage |
+|-----------|------------|-------------|-------------|---------------|
+| `check_connection` | None | `str` | Check if JEB plugin is running | Use to verify connection |
+| `manifest` | `filepath: str` | `str` | Get AndroidManifest.xml content | `manifest("/path/to/app.apk")` |
+| `decompile_method` | `filepath: str`<br>`method_signature: str` | `str` | Decompile specific method to Java code | `decompile_method("/path/to/app.apk", "Lcom/example/MainActivity;->onCreate(Landroid/os/Bundle;)V")` |
+| `decompile_class` | `filepath: str`<br>`class_signature: str` | `str` | Decompile entire class to Java code | `decompile_class("/path/to/app.apk", "Lcom/example/MainActivity;")` |
+| `find_callers` | `filepath: str`<br>`method_signature: str` | `list[(str,str)]` | Find all methods calling this method | `find_callers("/path/to/app.apk", "Lcom/example/Utils;->encrypt(Ljava/lang/String;)Ljava/lang/String;")` |
+| `find_overrides` | `filepath: str`<br>`method_signature: str` | `list[(str,str)]` | Find all methods overriding this method | `find_overrides("/path/to/app.apk", "Ljava/lang/Object;->toString()Ljava/lang/String;")` |
+
+## Native Code Analysis Tools (.so libraries / JNI)
+
+| Tool Name | Parameters | Return Type | Description | Example Usage |
+|-----------|------------|-------------|-------------|---------------|
+| `native_libraries` | `filepath: str` | `list` | Get list of native libraries in APK | `native_libraries("/path/to/app.apk")` |
+| `load_native_lib` | `filepath: str`<br>`lib_name: str` | `dict` | Load and get info about native library | `load_native_lib("/path/to/app.apk", "libnative.so")` |
+| `native_functions` | `filepath: str`<br>`lib_name: str` | `list` | Get functions in native library | `native_functions("/path/to/app.apk", "libnative.so")` |
+| `decompile_native` | `filepath: str`<br>`lib_name: str`<br>`function_address: str` | `str` | Decompile native function to C pseudocode | `decompile_native("/path/to/app.apk", "libnative.so", "0x1000")` |
+| `native_strings` | `filepath: str`<br>`lib_name: str` | `list` | Get strings from native library | `native_strings("/path/to/app.apk", "libnative.so")` |
+| `jni_methods` | `filepath: str` | `list` | Get JNI method mappings Java↔Native | `jni_methods("/path/to/app.apk")` |
+| `native_xrefs` | `filepath: str`<br>`lib_name: str`<br>`address: str` | `list` | Find cross-references to native address | `native_xrefs("/path/to/app.apk", "libnative.so", "0x1000")` |
+| `native_imports` | `filepath: str`<br>`lib_name: str` | `list` | Get imported functions/libraries | `native_imports("/path/to/app.apk", "libnative.so")` |
+| `native_exports` | `filepath: str`<br>`lib_name: str` | `list` | Get exported functions from library | `native_exports("/path/to/app.apk", "libnative.so")` |
+
+## Parameter Details
+
+### File Path Requirements
+- **filepath**: Must be an absolute path to the APK file
+- The APK file must be accessible to the JEB Pro instance
+- Multiple APK files can be analyzed simultaneously (up to 10 loaded artifacts)
+
+### Signature Formats
+JEB Pro uses Java-style internal addresses to identify items:
+
+| Item Type | Format | Example |
+|-----------|--------|---------|
+| Package | `Lcom/abc/` | `Lcom/example/myapp/` |
+| Class/Type | `Lcom/abc/Foo;` | `Lcom/example/MainActivity;` |
+| Method | `Lcom/abc/Foo;->methodName(parameters)returnType` | `Lcom/example/MainActivity;->onCreate(Landroid/os/Bundle;)V` |
+| Field | `Lcom/abc/Foo;->fieldName:Type` | `Lcom/example/MainActivity;->isDebug:Z` |
+
+### Common Java Type Signatures
+| Java Type | Signature | Description |
+|-----------|-----------|-------------|
+| `void` | `V` | Void return type |
+| `boolean` | `Z` | Boolean primitive |
+| `int` | `I` | Integer primitive |
+| `long` | `J` | Long primitive |
+| `String` | `Ljava/lang/String;` | String object |
+| `Bundle` | `Landroid/os/Bundle;` | Android Bundle |
+| `int[]` | `[I` | Integer array |
+| `String[]` | `[Ljava/lang/String;` | String array |
+
+## Return Value Details
+
+### String Returns
+- `manifest`: Returns the full AndroidManifest.xml content as text
+- `decompile_method`: Returns decompiled Java source code for method
+- `decompile_class`: Returns decompiled Java source code for entire class
+- `check_connection`: Returns success message or error with troubleshooting steps
+
+### List Returns
+- `find_callers`: Returns list of tuples `(address, details)` where:
+  - `address`: Memory address or method signature of the caller
+  - `details`: Additional information about the calling context
+- `find_overrides`: Returns list of tuples `(address, details)` for override relationships
+
+## Error Handling
+
+The server handles various error conditions:
+
+- **Connection Errors**: If JEB Pro plugin is not running, connection tools will provide instructions
+- **File Not Found**: Invalid file paths will raise exceptions
+- **Invalid Signatures**: Malformed method/class signatures will return appropriate error messages
+- **Analysis Errors**: Issues during decompilation will be reported with context
+
+## Setup Requirements
+
+1. **JEB Pro**: Must be running with the MCP plugin loaded
+2. **Plugin Activation**: Run `Edit -> Scripts -> MCP` in JEB Pro (shortcut: `Ctrl+Alt+M` on Windows/Linux, `Ctrl+Option+M` on macOS)
+3. **Network**: Server runs on `localhost:16161`
+4. **File Access**: APK files must be accessible from the JEB Pro process
+
+## Usage Examples
+
+### Basic Workflow
+```python
+# 1. Check connection
+check_connection()
+
+# 2. Analyze manifest
+app_manifest = manifest("/path/to/app.apk")
+
+# 3. Get class structure
+main_activity = decompile_class("/path/to/app.apk", "Lcom/example/MainActivity;")
+
+# 4. Analyze specific method
+onCreate_code = decompile_method("/path/to/app.apk", "Lcom/example/MainActivity;->onCreate(Landroid/os/Bundle;)V")
+
+# 5. Find callers
+callers = find_callers("/path/to/app.apk", "Lcom/example/Utils;->sensitiveMethod()V")
+```
+
+### Native Code Analysis
+```python
+# 1. Find native libraries
+libs = native_libraries("/path/to/app.apk")
+
+# 2. Load specific library
+lib_info = load_native_lib("/path/to/app.apk", "libnative.so")
+
+# 3. Get functions in library
+functions = native_functions("/path/to/app.apk", "libnative.so")
+
+# 4. Decompile native function
+native_code = decompile_native("/path/to/app.apk", "libnative.so", "0x1000")
+
+# 5. Find JNI mappings
+jni_mappings = jni_methods("/path/to/app.apk")
+
+# 6. Analyze imports/exports
+imports = native_imports("/path/to/app.apk", "libnative.so")
+exports = native_exports("/path/to/app.apk", "libnative.so")
+```
+
+### Security Analysis
+```python
+# Find all methods that call encryption functions
+encryption_callers = find_callers("/path/to/app.apk", "Ljavax/crypto/Cipher;->doFinal([B)[B")
+
+# Analyze crypto implementation
+crypto_class = decompile_class("/path/to/app.apk", "Lcom/example/crypto/CryptoHelper;")
+
+# Check for suspicious native functions
+for lib in native_libraries("/path/to/app.apk"):
+    strings = native_strings("/path/to/app.apk", lib['name'])
+    # Look for suspicious strings like "root", "su", "xposed"
+```
+
+## Notes
+
+- The server maintains a queue of loaded artifacts (max 10) for performance
+- Older artifacts are automatically unloaded when the limit is exceeded
+- All file paths must be absolute paths
+- The server is designed for programmatic access by AI models and automation tools 

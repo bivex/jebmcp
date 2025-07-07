@@ -6,59 +6,181 @@ from pydantic import Field
 T = TypeVar("T")
 
 @mcp.tool()
-def ping() -> str:
-    """Do a simple ping to check server is alive and running"""
-    return make_jsonrpc_request('ping')
-
-@mcp.tool()
-def get_manifest(filepath: str) -> str:
-    """Get the manifest of the given APK file in path, the passed in filepath needs to be a fully-qualified absolute path"""
+def manifest(filepath: str) -> str:
+    """Get the AndroidManifest.xml content of an APK file"""
     return make_jsonrpc_request('get_manifest', filepath)
 
 @mcp.tool()
-def get_method_decompiled_code(filepath: str, method_signature: str) -> str:
-    """Get the decompiled code of the given method in the APK file, the passed in method_signature needs to be a fully-qualified signature
+def decompile_method(filepath: str, method_signature: str) -> str:
+    """Decompile specific method to Java code
+    
     Dex units use Java-style internal addresses to identify items:
-        
     - package: Lcom/abc/
     - type: Lcom/abc/Foo;
     - method: Lcom/abc/Foo;->bar(I[JLjava/Lang/String;)V
     - field: Lcom/abc/Foo;->flag1:Z
 
-    @param filepath: the path to the APK file
-    @param method_signature: the fully-qualified method signature to decompile, e.g. Lcom/abc/Foo;->bar(I[JLjava/Lang/String;)V
-    the passed in filepath needs to be a fully-qualified absolute path
+    Args:
+        filepath: Absolute path to the APK file
+        method_signature: Fully-qualified method signature, e.g. Lcom/abc/Foo;->bar(I[JLjava/Lang/String;)V
     """
     return make_jsonrpc_request('get_method_decompiled_code', filepath, method_signature)
 
 @mcp.tool()
-def get_class_decompiled_code(filepath: str, class_signature: str) -> str:
-    """Get the decompiled code of the given class in the APK file, the passed in class_signature needs to be a fully-qualified signature
+def decompile_class(filepath: str, class_signature: str) -> str:
+    """Decompile entire class to Java code
+    
     Dex units use Java-style internal addresses to identify items:
-
     - package: Lcom/abc/
     - type: Lcom/abc/Foo;
     - method: Lcom/abc/Foo;->bar(I[JLjava/Lang/String;)V
     - field: Lcom/abc/Foo;->flag1:Z
 
-    @param: filepath: The path to the APK file
-    @param: class_signature: The fully-qualified signature of the class to decompile, e.g. Lcom/abc/Foo;
-    the passed in filepath needs to be a fully-qualified absolute path
+    Args:
+        filepath: Absolute path to the APK file
+        class_signature: Fully-qualified signature of the class, e.g. Lcom/abc/Foo;
     """
     return make_jsonrpc_request('get_class_decompiled_code', filepath, class_signature)
 
 @mcp.tool()
-def get_method_callers(filepath: str, method_signature: str) -> list[(str,str)]:
-    """
-    Get the callers of the given method in the APK file, the passed in method_signature needs to be a fully-qualified signature
-    the passed in filepath needs to be a fully-qualified absolute path
+def find_callers(filepath: str, method_signature: str) -> list[(str,str)]:
+    """Find all methods calling this method (cross-references)
+    
+    Args:
+        filepath: Absolute path to the APK file
+        method_signature: Fully-qualified method signature
+        
+    Returns:
+        List of tuples (address, details) for each caller
     """
     return make_jsonrpc_request('get_method_callers', filepath, method_signature)
 
 @mcp.tool()
-def get_method_overrides(filepath: str, method_signature: str) -> list[(str,str)]:
-    """
-    Get the overrides of the given method in the APK file, the passed in method_signature needs to be a fully-qualified signature
-    the passed in filepath needs to be a fully-qualified absolute path
+def find_overrides(filepath: str, method_signature: str) -> list[(str,str)]:
+    """Find all methods overriding this method
+    
+    Args:
+        filepath: Absolute path to the APK file
+        method_signature: Fully-qualified method signature
+        
+    Returns:
+        List of tuples (address, details) for each override
     """
     return make_jsonrpc_request('get_method_overrides', filepath, method_signature)
+
+@mcp.tool()
+def native_libraries(filepath: str) -> list:
+    """Get list of native libraries (.so files) in APK
+    
+    Args:
+        filepath: Absolute path to the APK file
+        
+    Returns:
+        List of native libraries with name, type, and architecture
+    """
+    return make_jsonrpc_request('get_native_libraries', filepath)
+
+@mcp.tool()
+def load_native_lib(filepath: str, lib_name: str) -> dict:
+    """Load and get info about specific native library
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library (e.g., "libnative.so")
+        
+    Returns:
+        Library info including architecture, entry point, base address
+    """
+    return make_jsonrpc_request('load_native_library', filepath, lib_name)
+
+@mcp.tool()
+def native_functions(filepath: str, lib_name: str) -> list:
+    """Get list of functions in native library
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        
+    Returns:
+        List of functions with addresses, names, signatures, and sizes
+    """
+    return make_jsonrpc_request('get_native_functions', filepath, lib_name)
+
+@mcp.tool()
+def decompile_native(filepath: str, lib_name: str, function_address: str) -> str:
+    """Decompile native function to C-like pseudocode
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        function_address: Address of the function (hex format)
+        
+    Returns:
+        Decompiled C-like pseudocode
+    """
+    return make_jsonrpc_request('decompile_native_function', filepath, lib_name, function_address)
+
+@mcp.tool()
+def native_strings(filepath: str, lib_name: str) -> list:
+    """Get strings from native library
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        
+    Returns:
+        List of strings with addresses, values, and lengths
+    """
+    return make_jsonrpc_request('get_native_strings', filepath, lib_name)
+
+@mcp.tool()
+def jni_methods(filepath: str) -> list:
+    """Get JNI method mappings between Java and native code
+    
+    Args:
+        filepath: Absolute path to the APK file
+        
+    Returns:
+        List of JNI method mappings with Java and native signatures
+    """
+    return make_jsonrpc_request('get_jni_methods', filepath)
+
+@mcp.tool()
+def native_xrefs(filepath: str, lib_name: str, address: str) -> list:
+    """Find cross-references to/from native address
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        address: Memory address (hex format)
+        
+    Returns:
+        List of cross-references with addresses and details
+    """
+    return make_jsonrpc_request('find_native_xrefs', filepath, lib_name, address)
+
+@mcp.tool()
+def native_imports(filepath: str, lib_name: str) -> list:
+    """Get imported functions/libraries for native library
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        
+    Returns:
+        List of imported functions with names, libraries, and addresses
+    """
+    return make_jsonrpc_request('get_native_imports', filepath, lib_name)
+
+@mcp.tool()
+def native_exports(filepath: str, lib_name: str) -> list:
+    """Get exported functions from native library
+    
+    Args:
+        filepath: Absolute path to the APK file
+        lib_name: Name of the native library
+        
+    Returns:
+        List of exported functions with names, addresses, and ordinals
+    """
+    return make_jsonrpc_request('get_native_exports', filepath, lib_name)
